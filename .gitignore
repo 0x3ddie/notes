@@ -1,12 +1,3 @@
-# Ignore everything
-/*
-
-# Except the One folder
-!/One
-!/.gitignore
-
-# Inside One, ignore everything
-/One/*
-
-# Except Scaling Book
-!/One/Scaling Book
+One/Excalidraw/
+One/copilot/
+.obsidian/
