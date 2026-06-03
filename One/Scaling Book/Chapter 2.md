@@ -89,31 +89,33 @@ A team wants to run a massive quantized inference workload across a full TPU v5e
 - Just isolate for batch size:$$\frac{B}{9.2 \times 10^{14}} > \frac{1}{1.6 \times 10^{10}}$$
 -  The simple answer is: $$B>\frac{9.2 \times 10^{14} \text{ FLOPs/s}}{1.6 \times 10^{10} \text{ bytes/s}} \implies B > 57,500$$
 - The processing batch needs to be at 57,500 tokens minimum to remain FLOPs bound over PCIe.
-- PCIe info dump: in typical use cases like gaming, you honestly won't notice the difference between a PCIe Gen 3 and a Gen 5. However, for AI serving and high throughput inference processes, PCIe transfer speeds directly affect how how quickly you can serve customers, as it impacts the amount of data you can transfer between your singular TPU and CPU host (for multiple TPUs, we bypass the CPU entirely during calculation and use the ICI to for All-Reduce/All-Gather operations. All TPUs in their nodes output their respective finished portion of the matrix directly to their host CPU). PCIe generations and quality differ in Speed per Lane (PCIe runs at 16Ghz FYI) and Lane Width. For AI processes, we would want the highest speeds per lane (+4GB/s per lane) and lane width (x16) for maximum bandwidth. After we hit 16Ghz in PCIe lane speeds, electrical signals travel too fast through the copper and quickly degrades into noise. SOTA PCIe generations use a technique: PAM4(Pulse Amplitude Modulation) which uses 4 distinct voltage levels(0v,1v,2v,3v) that allow us to send 2 bits per cycle (00,01,10,11), doubling the throughput of the same copper lane without increasing frequency. Old PCIe uses NRZ, or 2 voltage levels for 1 bit per cycle (0,1). Still, PCIe bandwidth becomes a looming bottleneck for large scale TPU use cases
+- PCIe info dump: in typical use cases like gaming, you honestly won't notice the difference between a PCIe Gen 3 and a Gen 5. However, for AI serving and high throughput inference processes, PCIe transfer speeds directly affect how how quickly you can serve customers, as it impacts the amount of data you can transfer between your singular TPU and CPU host (for multiple TPUs, we bypass the CPU entirely during calculation and use the ICI to for All-Reduce/All-Gather operations. All TPUs in their nodes output their respective finished portion of the matrix directly to their host CPU). PCIe generations and quality differ in Speed per Lane (PCIe runs at 16Ghz FYI) and Lane Width. For AI processes, we would want the highest speeds per lane (+4GB/s per lane) and lane width (x16) for maximum bandwidth. After we hit 16Ghz in PCIe lane speeds, electrical signals travel too fast through the copper and quickly degrades into noise. SOTA PCIe generations use a technique: PAM4(Pulse Amplitude Modulation) which uses 4 distinct voltage levels(0v,1v,2v,3v) that allow us to send 2 bits per cycle (00,01,10,11), doubling the throughput of the same copper lane without increasing frequency. Old PCIe uses NRZ, or 2 voltage levels for 1 bit per cycle (0,1). Still, PCIe bandwidth becomes a looming bottleneck for large scale TPU use cases. Also interestingly, there is an emerging use case for PCIe with photonics, where we use light optics instead of copper to utilize the speed of light.
 ### Question 3a [Next-Gen PCIe Gen 6 Server Node]
 
 An enterprise team is testing a next-generation AI chip featuring massive matrix processing lanes. They are serving an LLM layer on a single chip, and the weights are being streamed dynamically over a high-end **PCIe Gen 6 x16 motherboard bus link**.
 
 - **Hardware Specs:**
-    
     - Peak Compute Speed: $2.4 \times 10^{15} \text{ FLOPs/s}$ (2.4 PFLOPs)
     - Motherboard PCIe Bandwidth: $1.28 \times 10^{11} \text{ bytes/s}$ (128 GB/s)
-        
 - **The Task:** Using the balanced time inequality framework under the assumption that batch size is negligible relative to the internal model dimensions ($B \ll D$), determine the exact minimum batch size ($B$) required to keep this high-speed processor compute-bound.
-- 
+- Same process where we take the total operations required/peak compute speed > total memory ops/PCIe bandwidth:$$\frac{2BDF}{2.4 \times 10^{15}} > \frac{2(BD + DF + BF)}{1.28 \times 10^{11}}$$$$B > \frac{2.4 \times 10^{15} \text{ FLOPs/s}}{1.28 \times 10^{11} \text{ bytes/s}}$$
+- Which comes out to: $$B > 18,750$$ where because of the asymptotic reduction, we can jump straight to the HCI calculation and find we need at least 18,750 tokens within each batch to remain compute-bound.
 
 ### Question 3b [Edge Mobile Accelerator via PCIe Gen 4]
 
 A robotics lab is building a vision-language system that streams model layers on-demand across a low-power **PCIe Gen 4 x4 mobile bus interface** to a compact embedded accelerator core.
 
 - **Hardware Specs:**
-    
     - Peak Compute Speed: $8.0 \times 10^{13} \text{ FLOPs/s}$ (80 TFLOPs)
-        
     - Motherboard PCIe Bandwidth: $8.0 \times 10^9 \text{ bytes/s}$ (8 GB/s)
-        
 - **The Task:** Using the balanced time inequality framework under the assumption that $B \ll D$, calculate the exact minimum batch size ($B$) needed to ensure the low-power processor pipelines don't stall waiting for the mobile motherboard bus.
+- Same asymptotic reduction: $$\frac{2BDF}{8.0 \times 10^{13}} > \frac{2DF}{8.0 \times 10^9}$$$$B > \mathbf{10,000 \text{ tokens}}$$
+**Question 4 [general matmul latency]:** Let’s say we want to multiply a weight matrix int8[16384, 4096] by an activation matrix of size int8[B, 4096] where B is some unknown batch size. Let’s say we’re on 1 TPU v5e to start.
 
+1. How long will this multiplication take as a function of B? _Hint: it may help to calculate how long it will take to load the arrays from HBM and how long the multiplication will actually take. Which is bottlenecking you?_
+	1. This question is literally just asking us to algebraically isolate the variable B after accounting for all the bytes. We know our weight matrix bytes (16384 x 4096 x 1byte = 67,108,864 bytes), activation matrix bytes
+2. What if we wanted to run this operation out of VMEM? How long would it take as a function of B?
+	1. 
 ### Reference Numbers
 
 Here are some specific numbers for our chips:
