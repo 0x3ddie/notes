@@ -100,7 +100,7 @@ An enterprise team is testing a next-generation AI chip featuring massive matrix
     - Motherboard PCIe Bandwidth: $1.28 \times 10^{11} \text{ bytes/s}$ (128 GB/s)
         
 - **The Task:** Using the balanced time inequality framework under the assumption that batch size is negligible relative to the internal model dimensions ($B \ll D$), determine the exact minimum batch size ($B$) required to keep this high-speed processor compute-bound.
-- Assuming that 
+- 
 
 ### Question 3b [Edge Mobile Accelerator via PCIe Gen 4]
 
