@@ -23,7 +23,7 @@
   "treeStructure": true,
   "refreshSourceControl": true,
   "basePath": "",
-  "differentIntervalCommitAndPush": false,
+  "differentIntervalCommitAndPush": true,
   "changedFilesInStatusBar": true,
   "showedMobileNotice": true,
   "refreshSourceControlTimer": 7000,
@@ -32,7 +32,7 @@
   "submoduleRecurseCheckout": false,
   "gitDir": "",
   "showFileMenu": true,
-  "authorInHistoryView": "hide",
+  "authorInHistoryView": "initials",
   "dateInHistoryView": true,
   "diffStyle": "split",
   "hunks": {
