@@ -1,6 +1,12 @@
 # Ignore everything
 /*
 
-# Except Scaling Book (and future note folders you add)
-!/Scaling Book
+# Except the One folder
+!/One
 !/.gitignore
+
+# Inside One, ignore everything
+/One/*
+
+# Except Scaling Book
+!/One/Scaling Book
