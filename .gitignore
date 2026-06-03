@@ -1,0 +1,6 @@
+# Ignore everything
+/*
+
+# Except Scaling Book (and future note folders you add)
+!/Scaling Book
+!/.gitignore
