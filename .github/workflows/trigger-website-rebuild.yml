@@ -1,0 +1,14 @@
+name: Trigger website rebuild
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "One/Scaling Book/**"
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    steps:
+      - name: POST to Vercel deploy hook
+        run: curl -fSs -X POST "${{ secrets.WEBSITE_DEPLOY_HOOK_URL }}"
