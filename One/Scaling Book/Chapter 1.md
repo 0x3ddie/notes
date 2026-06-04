@@ -144,9 +144,7 @@ To combat the memory bottleneck of the unique batched weights from Question 4, a
 The operation is: $\text{bf16}[B,D] \cdot_D \text{FP4}[B,D,F] \to \text{bf16}[B,F]$.
 
 * **The Task:** Write out the exact non-approximated intensity equation, simplify it assuming hidden dimensions are massive ($D, F \gg 1$), and find the flat, constant Arithmetic Intensity ($I$). Does this quantization successfully raise the intensity above the TPU v5e's 240 OPs/byte requirement?
-* What I'm getting from this is essentially the same approach that doesn't really fix the problem. We have bf16, so (2)BD, (0.5) BDF, and (2)BF, and this just simplifies to 2BDF/0.5BDF, which still results in 4 OPs/byte, so we're still perma-bottlenecked. Clearly, to solve this issue, simple quantization approaches don't work.
-
-$$I = \frac{2BDF}{2BD + 0.5BDF + 2BF} \approx \frac{2BDF}{0.5BDF} = \frac{2}{0.5} = 4 \text{ OPs/byte}$$
+* What I'm getting from this is essentially the same approach that doesn't really fix the problem. We have bf16, so (2)BD, (0.5) BDF, and (2)BF, and this just simplifies to 2BDF/0.5BDF, which still results in 4 OPs/byte, so we're still perma-bottlenecked. Clearly, to solve this issue, simple quantization approaches don't work: $$I = \frac{2BDF}{2BD + 0.5BDF + 2BF} \approx \frac{2BDF}{0.5BDF} = \frac{2}{0.5} = 4 \text{ OPs/byte}$$
 ---
 
 ## Question 4b [Grouped-Expert Attention / Matmuls]
