@@ -1,6 +1,6 @@
 ---
 title: A Brief Intro to Roofline Analysis
-description: Chapter 1 worked problems
+description: Intro and Solutions
 published: true
 ---
 ## Introduction

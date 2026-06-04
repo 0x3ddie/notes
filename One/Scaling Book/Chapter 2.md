@@ -1,3 +1,113 @@
+---
+title: All about TPUs
+description: Overview and Worked Problems
+published: true
+---
+
+## How TPUs Work
+
+A TPU specializes in matmuls and contains a TensorCore attached to some fast memory (HBM, high bandwidth memory). A TensorCore has several components within that make it so good at math:
+
+- **Matrix Multiply Unit (MXU):** The core of the TensorCore. Performs matmuls using a systolic array.
+    
+- **Vector Processing Unit (VPU):** Does general math operations like ReLU, pointwise addition or multiplication between vectors, and reductions. Think of it as assisting the MXU.
+    
+- **Vector Memory (VMEM):** The in-between for the HBM and the MXU. Data loads into the VMEM in order for the MXU to actually do anything; it’s like an L1/L2 cache but larger and programmer-controlled.
+    
+
+### Other Components
+
+- **Scalar Unit:** Acts as the CPU by giving instructions to the VPU and MXU.
+    
+- **HBM (High Bandwidth Memory):** Stores the weights, activations, new batch data, etc. It usually has a capacity in the tens of GB. When operational, tensors come out of HBM into the MXU through the VMEM. MXU results are written back into HBM through VMEM. The speed of this depends on **HBM Bandwidth** (usually 1-2 TB/s), which determines how fast computations can be done.
+    
+
+### Pipelining and Overlapping Operations
+
+TPU operations are pipelined and overlapped. When we perform a matmul $X \times Y = Z$, we need to load chunks of $X$ and $Y$ into the MXU from the HBM, going through the VMEM first.
+
+While we’re copying chunks of the matrices from the HBM to VMEM, we’re performing MXU work in parallel and sending results $Z$ from the MXU back to the VMEM, which goes back into HBM. The work, being overlapped, essentially lets us hide the latency.
+
+Our goal is to shoot towards being compute-bound instead of memory-bound; this is fundamentally because we’re loading matrices into a systolic array, specialized for matmuls, and performing around 200 trillion multiply-adds per second. Because the compute is so fast, logically, limits are set on how quickly we can transport data back and forth. Compute-bound, again, just means we need to brute force more chips on-stack.
+
+## On VMEM
+
+VMEM is typically the solution to being memory-bound. It’s lightning fast compared to HBM (around $22\times$ faster, although with a capacity in the MB), while HBM has massive capacity. So we have an imbalance here:
+
+- The MXU basically instantly finishes our math; to keep our MXU running at 100% efficiency, we need a high arithmetic intensity of around **240** when pulling data from HBM.
+    
+- If we pull data from VMEM, we only need an intensity of **10-20**.
+    
+
+TPUs default to being memory bound here. If we’re running small batch operations, and because we can’t fit weights in the tiny VMEM, the MXU has to constantly fetch and wait for data from the HBM while instantly finishing operations. This is severely memory bound.
+
+To summarize the system:
+
+- Reading from the **HBM** starves the MXU, which needs an intensity of 240.
+    
+- Reading from the **VMEM** provides a perfect, constant feed of data, requiring an intensity of only 10-20, causing our system to be compute-bound instead.
+    
+
+If we can engineer our algorithm so that our working data fits perfectly within the VMEM, it is almost a given that we’ll avoid traditional memory-bound issues and default to compute-bound. However, because the cache is so small (few MBs), this is often very challenging.
+
+## On Chip Layouts
+
+Depending on how old the TPU is, we either have separate memory and accelerators (TPU v3 and older), while newer inference chips like v5e only have 1 TPU core per chip. Typically, though, a TPU chip can be arranged as a **‘megacore’** by having 2 TPU cores that share memory and act as 1 large accelerator.
+
+Chips are typically arranged in trays of 4 (so 8 cores, but 4 megacores, meaning 4 chips), connected to a CPU host via a PCIe network. Inference trays with the v5e have 2 trays per host instead of 1, but also 1 core per chip, so 8 chips == 8 cores. The host CPU loads data, executes programs, etc.
+
+As with the $\text{HBM} \leftrightarrow \text{VMEM}$ link, the $\text{CPU} \leftrightarrow \text{HBM}$ PCIe connection also has a specific bandwidth that constrains how quickly we can load from host memory to HBM or vice versa.
+
+## TPU Networks
+
+For GPUs, you might be familiar with GPU networks and Nvidia’s NV Link, which allows GPUs to act as a single compute stack. Google uses the **ICI network**, a direct comparable, to connect TPUs to each other in a Pod.
+
+There are 2 main configurations:
+
+- **2D Torus:** Older gen chips (v2 and v3), inference chips (v5e), and the Trillium generation (TPU v6) connect 4 nearest neighbors with edge links to form a 2D torus.
+    
+- **3D Torus:** V4 and v5p are connected to the nearest 6 neighbors, making a 3D torus.
+    
+
+The toroidal shapes reduce the maximum distance between any 2 nodes from $N$ to $N / 2$, which makes communication much faster.
+
+TPU Pods can get huge with ICI. **Superpods** are maximum pod sizes for specific chips:
+
+- **v4:** $16 \times 16 \times 16$
+    
+- **v5p:** $16 \times 20 \times 28$
+    
+
+These pods are made up of $4 \times 4 \times 4$ cubes (in racks) that are connected to each other via optical wraparound links, from which we can make very large topologies. Smaller topologies like $2 \times 2 \times 1$ or $2 \times 2 \times 2$ can be requested but without wraparounds, which doubles the time of most communications. Any multiple of a full cube $4 \times 4 \times 4$ will have wraparounds.
+
+### Key Difference: TPUs vs. GPUs
+
+- **GPUs** are connected via a hierarchy of switches that allow any GPU to communicate with any other GPU. Nvidia uses dedicated hardware chips called **NVSwitches** for this purpose. For instance, imagine an old-school telephone operator sitting at a switchboard. In an H100 node (8 GPUs) or B200 node (72 GPUs), every single GPU runs an NVLink cable into the NVSwitch. This central connection means that every GPU is only 1 switch/hop away from the other. GPU #1 can talk to GPU #72 with the same speed it can talk to GPU #2. The downside is this is extremely expensive and not proportionally scalable; they also consume power and do no actual math.
+    
+- **TPUs** are much cheaper since we don’t use switches, and chips connect to each other at the end of their grids. This forms either a 2D or 3D torus shape where each TPU is interconnected with their nearest 4 neighbors. So TPU #1 would plug into the TPU to the East, North, South, etc. This topology means that nodes are dramatically cheaper and simpler to build; to scale, we literally just connect more TPUs and cables at the end of the grid, and bandwidth per chip remains the same throughout. The disadvantage here is that if we want TPU #1 to talk to TPU #72, it has to traverse the physical barrier through all the intermediate TPUs (multi-hop). Thus, we need our software/compiler to be very smart to place all operations next to their immediate neighbor so chips don’t have to multi-hop.
+    
+
+### The Speed Hierarchy
+
+$$\begin{array}{rll} \textbf{VMEM:} & \text{On silicon itself, right next to MXU} & (22\times \text{ HBM}) \\ \textbf{HBM:} & \text{High Bandwidth Memory: Same package, different silicon} & (2.8 \text{ TB/s}) \\ \textbf{ICI:} & \text{Inter-Core Connect, cross-chip networking in grid topology} & (90 \text{ GB/s per axis}) \\ \textbf{PCIe:} & \text{Motherboard connecting GPU/TPU nodes to the CPU} & \\ \textbf{DCN:} & \text{Data Center Network, global network} & (6.25 \text{ GB/s - Ultimate bottleneck}) \end{array}$$
+
+For massive scale AI, DCN is a huge bottleneck we face. If our workload is so heavy that we exhaust a single slice (a single continuous ICI grid), we have to connect multiple slices together.
+
+Getting a matrix from a TPU in Slice A to a TPU in Slice B is lengthy:
+
+$$\text{Read from HBM} \to \text{PCIe} \to \text{CPU A} \to \text{Slice A NIC} \to \text{DCN} \to \text{Slice B NIC} \to \text{PCIe} \to \text{TPU B HBM}$$
+
+This throttles throughput from $2.8 \text{ TB/s}$ to $6.25 \text{ GB/s}$, a drop of several orders of magnitude.
+
+### Takeaway
+
+We need to be aware of the advantages/disadvantages of each component and each specific speed. We need to keep our compute cores operating at max efficiency, meaning communication must be proportional to networking speeds.
+
+Ideally, we execute compute locally at MXU/VMEM/HBM, shard model layers locally so we only talk to neighbors via ICI (no hops), and **ONLY** use DCN for infrequent operations like final weight optimizations at the end of training.
+
+> **Note:** If you want to see how systolic arrays work, I made a little interactive tutorial at [systolic.vercel.app](https://www.google.com/url?sa=E&source=gmail&q=https://systolic.vercel.app) that you can play around with.
+
+
 **Question 1 [bounding LLM latency]:** Say you want to sample from a 200B parameter model in bf16 that’s split across 32 TPU v4p. How long would it take to load all the parameters from HBM into the systolic array? _Hint: use the numbers above._
 1. With a 200B parameter model, and each parameter/element is 2 bytes, then our matrix weights are 400 billion bytes total. 
 2. Splitting across 32 TPUs = performing 32 loading/math operations in parallel. Using the v4p HBM Bandwidth per chip, which is 1.2e12, we can simply take 400gb/32TPUs to get the GB processed per TPU, and then simply divide those GB by the bandwidth of the chip to find how long it would take for each TPU (or all 32 TPUs) to process the entire weight matrix.
