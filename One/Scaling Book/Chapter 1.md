@@ -134,7 +134,7 @@ What if we wanted to perform $\text{int8}[B,D] \cdot_D \text{int8}[B,D,F] \to \t
 * **In what scenario would we expand our weight matrix to include the batch dimension?**
     This is a MoE layout that we see with models like Deepseek, Mistral, Llama3 MoE, where the feed forward network is broken up into several independent 'expert' matrices. Every batch of input tokens then goes through a routing algorithm that determines which 'expert' it goes to based on the token content. When a router decides every single token in B goes to a completely new expert, we're forced to load a unique weight matrix for every single token in the batch. Token 1 loads Matrix D,F, Token 2 loads Matrix D,F, etc.
 * **But wait, this happens in MoE models, right? And if the model just randomly decides, every token goes to a new expert, this phenomenon would just naturally occur?**
-    Yes. So in a nightmare scenario where Tokens 1,2,3,4 go through a router and are assigned Expert 1,2,3,4, we need to load that matrix 4 separate times (nonreusable because each expert has unique matrices). We fix this with Top-K routing tricks and Grouped-Expert Attention (Question 4b).
+    Yes. So in a nightmare scenario where Tokens 1,2,3,4 go through a router and are assigned Expert 1,2,3,4, we'd need to load that matrix 4 separate times (nonreusable because each expert has unique matrices). We fix this with Top-K routing tricks and Grouped-Expert Attention (Question 4b).
 
 ---
 
