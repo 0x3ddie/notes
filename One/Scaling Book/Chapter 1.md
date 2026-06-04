@@ -3,6 +3,133 @@ title: A Brief Intro to Roofline Analysis
 description: Chapter 1 worked problems
 published: true
 ---
+## Introduction
+
+### Why do TPUs matter?
+
+Tensor Processing Units (TPUs) are specialized hardware (AI-specific ASICs, or application-specific integrated circuits) used for solving matmul (matrix multiplication) problems at higher speed and less power than any other hardware, including GPUs.
+
+At a broad glance:
+
+- **TPUs** dominate in pre-training LLMs.
+    
+- **GPUs** dominate in high throughput, video/general ML, and general-purpose use cases (OS, word processing, web servers, etc).
+    
+
+Two of the three SOTA models have been trained on TPUs over GPUs (Claude Opus, Google Gemini), so the timing of this writeup could not be more perfect.
+
+> **Critique:** It should be known that while TPUs often offer better tokens/dollar compared to even SOTA Nvidia chips, they generally struggle with non-specialized algorithms or dynamic computation graphs. GPUs historically have been used to innovate because developers can worry about seamless customization and playing around instead of hyper-optimizing for the TPU systolic array, which certainly provides better situational computation. However, it’s likely this changes with how well-maintained and increasingly popular JAX is becoming; you may have seen recently that Meta has begun utilizing Google’s Trillium chips for some of their AI workloads.
+
+### Why is this called the ‘Scaling Book’? What is scaling and why is it important?
+
+Hopefully not to anyone's surprise, the AI game is not purely about tweaking and improving AI algorithms; rather we need to constantly think about how we use our software with hardware constraints. Cutting edge software is unavoidably tied to how efficiently we can use or scale on hardware.
+
+In fact, the perceptron and nascent concept of a ‘neural net’ have been around for a long time, but only became feasibly useful after Alex Krizhevsky wrote incredible CUDA code to be able to use GPUs and materialize AlexNet, one of the first proofs of life of neural nets. Neural nets were essentially useless until then, unable to scale and produce meaningful work on sluggish CPU chips.
+
+The goal of scaling is to be able to use more chips for training or inference while having a proportional increase in throughput. Ideally, we can always just add more chips (parallelism) and get more compute for the model to work with. Realistically, though, this often comes at the cost of added communication overhead between chips, and we become communication bound, unable to scale strongly.
+
+- **Example:** Let's say we have a small model running on a GPU, but we want to scale up since we have more users. But, when we add more GPUs, we find that with each additional unit, we suffer more communication lag; say each additional GPU is added only at 90% efficiency. So, no matter how much money we spend on hardware, we’ll inevitably hit a wall, and likely very early. We want to avoid this.
+    
+
+## Rooflines (Constraints)
+
+Algorithms have 3 hard constraints:
+
+1. How fast the computer performs math (Ops/s)
+    
+2. The bandwidth available to move data around (bytes/s)
+    
+3. How much storage we have (memory in bytes)
+    
+
+Knowing our constraints allows us to find the upper and lower bounds of time of any given computation. So why does an algorithm take a certain amount of time, like 50ms, instead of 50 seconds? This is due to computation, communication between chips, and communication within a chip.
+
+### A Quick Note Before Math
+
+I think its worth clearing up what FLOPs, OPs, TOPs, and TFLOPs are in the beginning:
+
+- **OPs** are just operations. A single operation is like a single $+$, a single $*$, or a single division.
+    
+- **FLOP** is just an operation for floating point numbers (basically any decimals). Because we use fp numbers so frequently, we generally refer to operations as FLOPs instead of OPs, which are more generic. So a single $+$ operation between 2 decimal numbers is 1 FLOP; it’s an OP for fp numbers.
+    
+- **TOPs** (Trillion operations per second): A spec sheet that says 100 TOPs usually implies int4/int8 math, which would typically be seen in highly quantized/optimized applications.
+    
+- **TFLOPs**: 100 Trillion floating point operations are just written as 100 TFLOPs ($10^{12}$).
+    
+- We have more weird naming like **GOPs/GFLOPs** which are billions of (fl)ops per second ($10^9$), and **POPs/PFLOPs** which are in the quadrillions of (fl)ops ($10^{15}$).
+    
+
+### On Computation
+
+At its core, a deep learning model is just a bunch of matmuls, with their operations of floating-point multiplications being known as ‘FLOPs’. Compute time can thus be calculated as:
+
+$$\text{Compute Time} = \frac{\text{Computation FLOPs}}{\text{Accelerator FLOPs}}$$
+
+We take a target # of FLOPs, like $1 \times 10^{12}$, and divide it by how quickly a piece of hardware can perform FLOPs; a Trillium (6th Gen TPU) chip can perform roughly $9.1 \times 10^{14}$ FLOPs.
+
+$$\frac{1 \times 10^{12} \text{ FLOPs}}{9.1 \times 10^{14} \text{ FLOPs/s}} = 1.1\text{ms to perform all those operations on the v6e.}$$
+
+### Communication Within and Between Chips
+
+We measure this with:
+
+$$\text{Communication Time} = \frac{\text{Communication Bytes}}{\text{Network or Bandwidth Bytes}}$$
+
+The bandwidth within and between chips is the bottleneck on how quickly bytes can be transferred. We can find the lower bound of training by using the higher number between compute and comm time, and the upper bound by adding them together.
+
+There are situations where we need to figure out if we are:
+
+- **Compute bound:** Where our hardware is FULLY utilized.
+    
+- **Communication bound:** Where some parts of the chip may be idle and waiting for bytes to transfer.
+    
+
+We can use **operational intensity**, where we divide $\text{Computation FLOPs} / \text{Communication Bytes}$, and effectively find the FLOPs per byte of a given operation. When the intensity is high, we use most of the available FLOPs, suggesting we’re more compute bound, and vice versa. If we know that a chip is performing at a lower operational intensity than its supposed FLOPs/byte, we’re bound by byte loading and can’t fully utilize the hardware, and should probably spend more time working on networking and bandwidth.
+
+- **Example (Dot Product $x \cdot y$):** We need to take $x$ and $y$ from memory, each of which are $2 \cdot N$ ($2N$ bytes), perform $N$ multiplications and $N - 1$ additions, and write 2 bytes back into HBM:
+    
+    $$\frac{N + N - 1}{2N + 2N + 2} \approx \frac{1}{2}$$
+    
+    This means 0.5 floating point operations per byte loaded; we’re communication bound.
+    
+
+Think of it as a chef and a food prepper. The prepper needs to constantly prepare ingredients for the chef to make; if he can’t prep fast enough, the chef (our hardware) sits idle. If he preps too quickly (bandwidth), our chef can’t cook fast enough.
+
+The reason operational intensity is important: when we diagnose how to optimize our models further, we absolutely need to figure out if we’re hardware-bound, so we can just slap on more compute (more complicated than that but its fine for now), or communication-bound so we can focus on improving bandwidth, maybe invest in some memory hardware. Hence why GPUs use things like NV Link, or TPUs use ICI (inter-core connects).
+
+## Expanding on Matmuls
+
+We can think of matrix multiplications as the core of ML, and I think it’s good to know these problems by heart. Where $X \times Y \to Z$, $X$ has the shape bf16 $[B,D]$, $Y$ has shape bf16 $[D,F]$, and $Z$ has shape bf16 $[B,F]$, the intensity can be found with:
+
+$$\text{Intensity} = \frac{2 \cdot B \cdot D \cdot F}{2 \cdot B \cdot D + 2 \cdot D \cdot F + 2 \cdot B \cdot F}$$
+
+The numerator is roughly our work done, where we multiply the matrices, and the denominator signifies the total size of the matrices we need to move from memory to processor and then back. Again:
+
+$$\text{Intensity} = \frac{\text{Work}}{\text{Weight}}$$
+
+There’s a cool trick: in larger transformer models, the hidden dims ($D,F$) are huge, but batch size $B$ is relatively small. The math can simplify down to:
+
+$$\text{Intensity} \approx B$$
+
+We can assume that our Intensity is just our batch size.
+
+Most of the constraint work we’ve done so far has been within a chip; internal bandwidth and compute time. However, in production, we’ll find that rarely is a single chip used. Instead, most of the important rooflines to think about are communications between chips; thus, we need to think of matrix operations being split, or **sharded**, across multiple TPUs.
+
+We can start with $X$ and $Y$ matrices, both of which are too big to compute efficiently on 1 single TPU. So we have TPU 0 and 1. We must split the inner dimensions ($D$) in half, so TPU 0 performs matmul on the left side of $X$ with the upper half of $Y$, and TPU 1 performs matmul on the right side of $X$ with the lower half of $Y$.
+
+This step gives us 2 partial sums of what we want; how do we combine them? To get final matrix $Z$, we need to send sums to each other over the network cable and combine them. This is where we figure out Network Traffic, which is strictly determined by the Batch Size $B$ and Output Features $F$, resulting in the shape $BF$. Assuming bfloat16 (2 bytes per number), the total data being sent is $2BF$. So we end up with this equation:
+
+$$\text{Network Intensity} = \frac{B \cdot D \cdot F}{2 \cdot B \cdot F}$$
+
+Or, Math work (only $B \cdot D \cdot F$ because each chip does half the work) divided by network traffic (bytes sent, $2BF$). This cancels out to:
+
+$$\text{Network Intensity} = \frac{D}{2}$$
+
+This should be interesting because the bottleneck depends on $D$ and not $B$. Increasing batch size does cause more math to be done, but also proportionally increases how much data is sent over the network; larger inner dimensions $D$ causes the amount of math being done to increase significantly, but the resulting size of $BF$ does not change.
+
+To summarize, network cables between chips are much, much slower than compute time and chip memory itself.
+
+
 ## Question 1 [int8 matmul]
 Say we want to do the matmul $X[B,D] \cdot Y[D,F] \to Z[B,F]$ in int8 precision (1 byte per parameter) instead of bfloat16 (2 bytes per parameter) since TPUs/GPUs can do matmuls faster in lower precision.
 
