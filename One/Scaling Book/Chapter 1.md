@@ -1,10 +1,8 @@
 ---
-title: "Hardware-Aware LLM Inference & Arithmetic Intensity"
-description: "Chapter 1 worked problems: arithmetic intensity, rooflines, quantization, MoE."
+title: A Brief Intro to Roofline Analysis
+description: Chapter 1 worked problems
 published: true
 ---
-# Hardware-Aware LLM Inference & Arithmetic Intensity
-
 ## Question 1 [int8 matmul]
 Say we want to do the matmul $X[B,D] \cdot Y[D,F] \to Z[B,F]$ in int8 precision (1 byte per parameter) instead of bfloat16 (2 bytes per parameter) since TPUs/GPUs can do matmuls faster in lower precision.
 
@@ -22,11 +20,11 @@ Say we want to do the matmul $X[B,D] \cdot Y[D,F] \to Z[B,F]$ in int8 precision 
     * Math time is OPs/compute speed (given as $3.94 \times 10^{14}$), so $\frac{2BDF}{3.94 \times 10^{14}}$.
     * Communication time is total bytes to be transferred / network comm speed (given). So this is $\frac{BD + DF + BF}{8.2 \times 10^{11}}$.
 
-Assume our HBM bandwidth is $8.2 \times 10^{11}\text{ bytes/s}$ and our int8 peak OPs/s is $3.94 \times 10^{14}$ (about $2\times$ bfloat16).
+Assume our HBM bandwidth is $8.2 \times 10^{11}\text{ bytes/s}$ and our int8 peak OPs/s is $3.94 \times 10^{14}$ (about $2\times$ bf16).
 
 ---
 
-### Question 1a [fp4 weight-only quantization]
+## Question 1a [fp4 weight-only quantization]
 To fit a massive model onto fewer chips, you compress the weights down to FP4 (0.5 bytes per element). However, to keep accuracy high, your input activations, outputs, and the actual compute cores run in bfloat16 (2 bytes per element).
 
 * **How many total FLOPs are performed?** We still perform $2BDF$ OPs/FLOPs. The actual math units are still multiplying the dequantized FP4 numbers (into BF16), quantization only changes the denominator of our intensity equation but not our numerator. 
@@ -44,8 +42,7 @@ To fit a massive model onto fewer chips, you compress the weights down to FP4 (0
 Assume our HBM bandwidth is $8.2 \times 10^{11}\text{ bytes/s}$ and our peak bfloat16 compute speed is $1.97 \times 10^{14}\text{ FLOPs/s}$. The operation is $X[B, D] \times Y[D, F] \to Z[B, F]$.
 
 ---
-
-### Question 1b [B200 int8 matmul]
+## Question 1b [B200 int8 matmul]
 Let's see what happens when you shift the exact same int8 matmul from Question 1 over to next-generation hardware. You are running a uniform int8 matmul (1 byte per element for activations, weights, and outputs) on an NVIDIA B200 accelerator.
 
 * **What is the hardware's intrinsic critical arithmetic intensity ($\frac{\text{Peak OPs}}{\text{Bandwidth}}$)?**
@@ -110,7 +107,7 @@ Walking through this manually instead of dumping a script. Basically want to kno
 
 ---
 
-### Question 3a [Exact Roofline under Heavy Asymmetry]
+## Question 3a [Exact Roofline under Heavy Asymmetry]
 In many modern transformer architectures (like LLaMA's SwiGLU MLP layers), the projection matrix is highly asymmetric, where the intermediate dimension $F$ is significantly larger than the hidden dimension $D$ (typically $F = \frac{8}{3}D$). Let's evaluate the exact roofline performance for an asymmetric layer where $D = 4096$ and $F = 11008$ using bfloat16 precision (2 bytes per element).
 
 Using the exact, non-approximated byte traffic equation ($\text{Bytes} = 2BD + 2DF + 2BF$), calculate the exact theoretical batch size ($B$) where $\text{flops\_time}$ perfectly equals $\text{comms\_time}$ on a TPU v5e ($1.97 \times 10^{14}\text{ FLOPs/s}$, $8.2 \times 10^{11}\text{ bytes/s}$). Round your final answer to the nearest whole token.
@@ -141,7 +138,7 @@ What if we wanted to perform $\text{int8}[B,D] \cdot_D \text{int8}[B,D,F] \to \t
 
 ---
 
-### Question 4a [Batch-Dependent Mixed Precision]
+## Question 4a [Batch-Dependent Mixed Precision]
 To combat the memory bottleneck of the unique batched weights from Question 4, an architecture team proposes keeping the batch-dependent weight tensor in highly compressed FP4 (0.5 bytes per parameter), while keeping the shared token activations and final outputs in standard bfloat16 (2 bytes per parameter) to preserve accuracy.
 
 The operation is: $\text{bf16}[B,D] \cdot_D \text{FP4}[B,D,F] \to \text{bf16}[B,F]$.
@@ -152,7 +149,7 @@ The operation is: $\text{bf16}[B,D] \cdot_D \text{FP4}[B,D,F] \to \text{bf16}[B,
 $$I = \frac{2BDF}{2BD + 0.5BDF + 2BF} \approx \frac{2BDF}{0.5BDF} = \frac{2}{0.5} = 4 \text{ OPs/byte}$$
 ---
 
-### Question 4b [Grouped-Expert Attention / Matmuls]
+## Question 4b [Grouped-Expert Attention / Matmuls]
 Instead of giving every single token its own unique weight matrix, a team designs a "Grouped" setup. The batch $B$ is divided into a fixed number of distinct parallel groups $G$. All tokens assigned to the same group share the exact same weight matrix.
 
 The operation is: $\text{int8}[B,D] \cdot_D \text{int8}[G,D,F] \to \text{int8}[B,F]$, where $G$ is a fixed constant, and $B$ can scale up arbitrarily ($B \gg G$).
@@ -165,7 +162,7 @@ The operation is: $\text{int8}[B,D] \cdot_D \text{int8}[G,D,F] \to \text{int8}[B
 * And furthermore: $$I \approx \frac{2D^2}{2D} = D$$
 * If our arithmetic intensity is dictated by our model's hidden dimensions, and $D=4096$, our operational intensity approaches 4096OPs/byte, which is way higher than our hardware limit of 240OPs/byte. Our MoE models can now run at/beyond the peak compute ceiling of the chip.
 
-**Question 5 [Memory Rooflines for GPUs]:** 
+## Question 5 [Memory Rooflines for GPUs] 
 Using the spec sheet provided by NVIDIA for the H100 SXM, calculate the batch size at which a bfloat16 matrix multiplication will become compute-bound. Note that the Tensor Core FLOPs numbers are twice the true value since they’re only achievable with structured sparsity.
 
 Assume our HBM3 memory bandwidth is $3.35 \times 10^{12}$ bytes/s and our peak dense, non-sparse bfloat16 compute speed is $9.89 \times 10^{14}$ FLOPs/s. The operation is a uniform bfloat16 matmul ($2$ bytes per element) $X[B, D] \times Y[D, F] \to Z[B, F]$, assuming $B \ll D, F$.
