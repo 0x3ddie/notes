@@ -113,9 +113,19 @@ A robotics lab is building a vision-language system that streams model layers on
 **Question 4 [general matmul latency]:** Let’s say we want to multiply a weight matrix int8[16384, 4096] by an activation matrix of size int8[B, 4096] where B is some unknown batch size. Let’s say we’re on 1 TPU v5e to start.
 
 1. How long will this multiplication take as a function of B? _Hint: it may help to calculate how long it will take to load the arrays from HBM and how long the multiplication will actually take. Which is bottlenecking you?_
-	1. This question is literally just asking us to algebraically isolate the variable B after accounting for all the bytes. We know our weight matrix bytes (16384 x 4096 x 1byte = 67,108,864 bytes), activation matrix bytes
+	1. This question is literally just asking us to algebraically isolate the variable B after accounting for all the bytes. We know our weight matrix bytes (16384 x 4096 x 1byte = 67,108,864 bytes), activation matrix bytes (B x 4096 x 1byte = 4096B), and output bytes (B x 16384 x 1 = 16384B bytes). Then we also find our OP bytes, which is 2BDF, so (2 x B x 4096 x 16384) 134,217,728B Operations. 
+	2. $$T_{\text{compute}}(B) = \frac{134,217,728B}{3.94 \times 10^{14}} \approx \mathbf{3.407 \times 10^{-7}B \text{ seconds}}$$
+	3. $$T_{\text{HBM}}(B) = \frac{67,108,864 + 20,480B}{8.2 \times 10^{11}}$$
+	4. $$T_{\text{HBM}}(B) \approx \mathbf{8.184 \times 10^{-5} + 2.498 \times 10^{-8}B \text{ seconds}}$$
+	5. We can't execute the math faster than we can load memory, so looking back in [[Chapter 1]], our execution duration is the maximum of these 2 independent times. Using the numbers we got, for small batch sizes like B = 1, $T_{\text{HBM}} \approx 81.84 \ \mu\text{s}$ while $T_{\text{compute}} \approx 0.34 \ \mu\text{s}$, meaning a dominant memory bottleneck. So what batch size would we need to become compute bound? We simply set the two systems equal to each other: $$3.407 \times 10^{-7}B = 8.184 \times 10^{-5} + 2.498 \times 10^{-8}B$$
+
+$$3.157 \times 10^{-7}B = 8.184 \times 10^{-5}$$
+
+$$B \approx \mathbf{259.2}$$
+
+
 2. What if we wanted to run this operation out of VMEM? How long would it take as a function of B?
-	1. 
+	1. This gives us a scenario where we directly load our matrices from VMEM to our MXU. As a refresher, VMEM acts as a high-speed inbetween for the HBM and the MXU. While our MXU is completing math, our VMEM prefetches numbers from the HBM, which allows the MXU to pull in new numbers after it spits the output back into the VMEM. VMEM is extremely tiny, and we'll assume for this question the VMEM to MXU bandwidth is around 20-22x the speed of HBM to VMEM bandwidth
 ### Reference Numbers
 
 Here are some specific numbers for our chips:

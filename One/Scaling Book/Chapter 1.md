@@ -1,3 +1,8 @@
+---
+title: "Hardware-Aware LLM Inference & Arithmetic Intensity"
+description: "Chapter 1 worked problems: arithmetic intensity, rooflines, quantization, MoE."
+published: true
+---
 # Hardware-Aware LLM Inference & Arithmetic Intensity
 
 ## Question 1 [int8 matmul]
