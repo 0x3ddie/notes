@@ -1,5 +1,5 @@
 ---
-title: Sharded Matrices and How to Multiply Them
+title: How to Parallelize a Transformer for Training
 description: Overview and Worked Problems
 published: true
 ---

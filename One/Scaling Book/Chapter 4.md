@@ -1,5 +1,5 @@
 ---
-title: Sharded Matrices and How to Multiply Them
+title: All the Transformer Math
 description: Overview and Worked Problems
 published: true
 ---
