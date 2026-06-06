@@ -295,7 +295,38 @@ $$3.157 \times 10^{-7}B = 8.184 \times 10^{-5} \implies B \approx \mathbf{259.2}
 
 **What if we wanted to run this operation out of VMEM? How long would it take as a function of B?**
 
-This gives us a scenario where we directly load our matrices from VMEM to our MXU. As a refresher, VMEM acts as a high-speed inbetween for the HBM and the MXU. While our MXU is completing math, our VMEM prefetches numbers from the HBM, which allows the MXU to pull in new numbers after it spits the output back into the VMEM. VMEM is extremely tiny, and we'll assume for this question the VMEM to MXU bandwidth is around 20-22x the speed of HBM to VMEM bandwidth.
+This gives us a scenario where we directly load our matrices from VMEM to our MXU. As a refresher, VMEM acts as a high-speed inbetween for the HBM and the MXU. While our MXU is completing math, our VMEM prefetches numbers from the HBM, which allows the MXU to pull in new numbers after it spits the output back into the VMEM. Our general assumption is that although VMEM is microscopic compared to our HBM, it's 22x our HBM bandwidth speed, so multiplying $8.2e11$ x 22 gives us 1.80e13, and repeating the same algebra above gives us B > 11.
+
+### Question 4a [Next-Gen TPU v6e Core Scaling]
+
+Let's scale up to Google's newer **TPU v6e** architecture. A team wants to run an `int8` matrix multiplication matching the dimensions of your original notes (`int8[16384, 4096] × int8[B, 4096]`).
+
+- **Hardware Specs (TPU v6e):**
+    
+    - Peak Compute Speed: $9.20 \times 10^{14} \text{ OPs/s}$
+        
+    - HBM Memory Bandwidth: $1.60 \times 10^{12} \text{ bytes/s}$
+        
+    - **Architectural Baseline:** The v6e internal VMEM-to-MXU bus features a design factor of exactly **$24\times$** the local HBM bandwidth.
+        
+- **The Task:** 
+	1. Calculate the raw theoretical VMEM bandwidth for the TPU v6e.
+    
+    2. Assuming the arrays are resident in VMEM, derive the minimum token batch size ($B$) required to cross the critical intensity threshold and become completely compute-bound.
+### Question 4b [Accounting for Practical Contention]
+
+An engineering team is running the exact same TPU v5e configuration from your textbook (`int8[16384, 4096] × int8[B, 4096]`), utilizing a baseline single-chip HBM bandwidth of $8.2 \times 10^{11} \text{ bytes/s}$ and an `int8` compute ceiling of $3.94 \times 10^{14} \text{ OPs/s}$.
+
+However, instead of using the perfect theoretical multiplier of 22, the compiler team wants to account for real-world **bandwidth contention** (weights, activations, and outputs fighting for the internal bus lanes). They tell you to use the realistic practical factor of **$20\times$**.
+
+- **The Task:** 
+	1. Calculate the realistic, practical VMEM bandwidth under contention.
+    
+    2. Determine the new minimum batch size ($B$) needed to saturate the execution pipelines under these real-world conditions. Compare it to the theoretical boundary ($B > 11$) to see how contention shifts your operational requirements.
+
+
+
+
 
 ## Reference Numbers
 
