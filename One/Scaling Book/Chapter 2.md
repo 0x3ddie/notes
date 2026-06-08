@@ -295,39 +295,64 @@ $$3.157 \times 10^{-7}B = 8.184 \times 10^{-5} \implies B \approx \mathbf{259.2}
 
 **What if we wanted to run this operation out of VMEM? How long would it take as a function of B?**
 
-This gives us a scenario where we directly load our matrices from VMEM to our MXU. As a refresher, VMEM acts as a high-speed inbetween for the HBM and the MXU. While our MXU is completing math, our VMEM prefetches numbers from the HBM, which allows the MXU to pull in new numbers after it spits the output back into the VMEM. Our general assumption is that although VMEM is microscopic compared to our HBM, it's 22x our HBM bandwidth speed, so multiplying $8.2e11$ x 22 gives us 1.80e13, and repeating the same algebra above gives us B > 11.
+VMEM is 22x our HBM bandwidth speed, so multiplying $8.2e11$ x 22 gives us 1.80e13, and repeating the same algebra above gives us B > 11.
 
 ### Question 4a [Next-Gen TPU v6e Core Scaling]
 
 Let's scale up to Google's newer **TPU v6e** architecture. A team wants to run an `int8` matrix multiplication matching the dimensions of your original notes (`int8[16384, 4096] × int8[B, 4096]`).
 
-- **Hardware Specs (TPU v6e):**
+**Hardware Specs (TPU v6e):**
     
-    - Peak Compute Speed: $9.20 \times 10^{14} \text{ OPs/s}$
+- Peak Compute Speed: $9.20 \times 10^{14} \text{ OPs/s}$
         
-    - HBM Memory Bandwidth: $1.60 \times 10^{12} \text{ bytes/s}$
+- HBM Memory Bandwidth: $1.60 \times 10^{12} \text{ bytes/s}$
         
-    - **Architectural Baseline:** The v6e internal VMEM-to-MXU bus features a design factor of exactly **$24\times$** the local HBM bandwidth.
-        
-- **The Task:** 
-	1. Calculate the raw theoretical VMEM bandwidth for the TPU v6e.
-    
-    2. Assuming the arrays are resident in VMEM, derive the minimum token batch size ($B$) required to cross the critical intensity threshold and become completely compute-bound.
+- **Architectural Baseline:** The v6e internal VMEM-to-MXU bus features a design factor of exactly **$24\times$** the local HBM bandwidth.
+
+ **The Task:** 
+1. Calculate the raw theoretical VMEM bandwidth for the TPU v6e. $$\text{VMEM Bandwidth} = 24 \times (1.60 \times 10^{12} \text{ bytes/s}) = \mathbf{3.84 \times 10^{13} \text{ bytes/s}}$$
+2. Assuming the arrays are resident in VMEM, derive the minimum token batch size ($B$) required to cross the critical intensity threshold and become completely compute-bound.
+	1. Int8 means 1 byte per element. We know our 2BDF operations (2 x B x 16384 x 4096) and our BD DF BF network transfers. Clearly our weight matrix is given as 16384 x 4096, and our B is unknown.  Then we just want to put each respective total over their peak compute and peak HBM bandwidth to find compute-bound batch size for HBM, or swap out HBM for VMEM respectively. We're already given our Peak Compute Speed, so we need to find our total int8 OPs and total traffic: $$\text{Total Storage Traffic Bytes} = 67,108,864 + 4,096B + 16,384B = \mathbf{67,108,864 + 20,480B \text{ bytes}}$$$$\text{Total INT8 OPs} = 2 \times B \times 16384 \times 4096 = \mathbf{134,217,728B}$$
+	2. Set up our inequality equation: $$\frac{134,217,728B}{9.20 \times 10^{14}} > \frac{67,108,864 + 20,480B}{3.84 \times 10^{13}}$$
+	3. Simplify both sides by dividing individual terms, and then isolate for B:$$1.4589 \times 10^{-7}B > 1.7476 \times 10^{-6} + 5.3333 \times 10^{-10}B$$$$B > \frac{1.7476 \times 10^{-6}}{1.4536 \times 10^{-7}}$$
+	4. Our required batch size needs to be:$$B > \mathbf{12.02}$$
+	5. A side note: If you're curious about why we're running these hypothetical scenarios where we run entirely 'out of VMEM', that makes sense, because VMEM is, in reality only a few dozen MB at best (but much faster than HBM) while HBM is several dozen GB at least. 'Running out of VMEM' is a scenario where we experience perfect, unthrottled streaming speed done with a technique called prefetching. When we load Chunk A from our HBM into our VMEM, while the MXU is performing, the memory controller is already pulling Chunk B out of HBM so the MXU can instantly move to the next Chunk without waiting. This 'perfect prefetching scenario' means we completely mask the HBM delay so we can see how the chip acts when it's not lacking data.
 ### Question 4b [Accounting for Practical Contention]
 
 An engineering team is running the exact same TPU v5e configuration from your textbook (`int8[16384, 4096] × int8[B, 4096]`), utilizing a baseline single-chip HBM bandwidth of $8.2 \times 10^{11} \text{ bytes/s}$ and an `int8` compute ceiling of $3.94 \times 10^{14} \text{ OPs/s}$.
 
 However, instead of using the perfect theoretical multiplier of 22, the compiler team wants to account for real-world **bandwidth contention** (weights, activations, and outputs fighting for the internal bus lanes). They tell you to use the realistic practical factor of **$20\times$**.
 
-- **The Task:** 
-	1. Calculate the realistic, practical VMEM bandwidth under contention.
-    
-    2. Determine the new minimum batch size ($B$) needed to saturate the execution pipelines under these real-world conditions. Compare it to the theoretical boundary ($B > 11$) to see how contention shifts your operational requirements.
+**The Task:** 
+1. Calculate the realistic, practical VMEM bandwidth under contention.
+	- $$\text{Practical VMEM Speed} = 20 \times (8.2 \times 10^{11} \text{ bytes/s}) = \mathbf{1.64 \times 10^{13} \text{ bytes/s}}$$
+2. Determine the new minimum batch size ($B$) needed to saturate the execution pipelines under these real-world conditions. Compare it to the theoretical boundary ($B > 11$) to see how contention shifts your operational requirements.
+	- $$\frac{134,217,728B}{3.94 \times 10^{14}} > \frac{67,108,864 + 20,480B}{1.64 \times 10^{13}}$$
 
+$$3.4065 \times 10^{-7}B > 4.0920 \times 10^{-6} + 1.2488 \times 10^{-9}B$$
 
+$$3.3940 \times 10^{-7}B > 4.0920 \times 10^{-6}$$
 
+$$B > 12.06 \implies \mathbf{B \ge 13 \text{ tokens}}$$
+	- Because of shared bus lane overheads, our theoretical token concurrency shifts from a theoretical B > 11 to a B > 13 tokens to fully mask memory latency. 
+	- What does B > x mean? For users, smaller x this means less time to first token (TFTT) since we don't have to wait for other users tokens to finish processing. For engineers, larger x means more hardware utilization and better efficiency. The trick is to have this equilibrium between low TFTT and maximum hardware utilization (so not to waste money through starvation cycles). 
 
+**Question 5 [ICI bandwidth]:** Let’s say we have a TPU v5e `4x4` slice. Let’s say we want to send an array of type `bf16[8, 128, 8192]` from `TPU{0,0}` to `TPU{3, 3}`. Let’s say the per-hop latency for TPU v5e is 1μs.
 
+1. How soon will the first byte arrive at its destination?
+	1. In a standard 16x16 pod, the outer edges have physical wraparound cables. But paying attention to the word slice means our 4x4 is just a smaller cluster, a subspace of the larger grid that behaves as a flat 2D mesh, not Torus. Travelling from 0,0 to 3,3 in a Mesh means we go up by 3, and then go horizontal by 3, so 6 hops total, or 6μs.
+2. How long will the total transfer take?
+	1. Because this is a networking problem, we ignore the local math operations that we've done in prior problems. We only care about the physical volume of the tensor being sent between chips. So we have 8 x 128 x 8192 x 2(bf16) = 1.7e7 bytes. If we send this entire package over a single pipe, 1.7e7/4.5e10 = 372~ microseconds. But, with how ICI is configured, and how we can travel bidirectionally (half the packet travels vertically to 3,3, the other half starts horizontally to 3,3), that speed can be halved to 186 microseconds, plus the 6 microseconds for our hop latency, so 192 microseconds.
+
+**Question 5a [Next-Gen TPU v6e Cordon Topology]:** A bf16[16, 256, 4096] tensor must be routed from coordinate (0,0) to (7,7) inside an isolated 8x8 slice of TPU v6e chips. The architecture features a per-hop routing delay of $0.8 \ \mu\text{s}$ and an individual interconnect link bandwidth of $1.0 \times 10^{11} \text{ bytes/s}$. Wrap-around torus connections are disabled for partitions under a 16-chip axis length.
+1. Calculate the First Byte Arrival Time based on flat 2D mesh hop geometry.
+	1. 
+2. Calculate the Total Transfer Time assuming the data footprint is split equally across two active routing ports simultaneously.
+	1. 
+
+**Question 5b [Asymmetric Rectangular Slice Routing]:** A bf16[4, 512, 2048] tensor is transmitted across a rectangular 4x8 sub-slice of TPU v5e chips from coordinate (0,0) to (3,7). The grid lacks wrap-around connections on both axes. Each interconnect channel features a link bandwidth of $4.5 \times 10^{10} \text{ bytes/s}$ and a fixed router delay of $1.0 \ \mu\text{s}$ per hop.
+1. Calculate the First Byte Arrival Time.
+2. Determine the Total Transfer Time utilizing dual-port parallel streaming out of the source coordinate.
 ## Reference Numbers
 
 Here are some specific numbers for our chips:
