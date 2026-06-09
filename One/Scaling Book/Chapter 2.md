@@ -316,7 +316,9 @@ Let's scale up to Google's newer **TPU v6e** architecture. A team wants to run a
 	- $$\text{Total Storage Traffic Bytes} = 67,108,864 + 4,096B + 16,384B = \mathbf{67,108,864 + 20,480B \text{ bytes}}$$
 	- $$\text{Total INT8 OPs} = 2 \times B \times 16384 \times 4096 = \mathbf{134,217,728B}$$
 	- Set up our inequality equation: $$\frac{134,217,728B}{9.20 \times 10^{14}} > \frac{67,108,864 + 20,480B}{3.84 \times 10^{13}}$$
-	- Simplify both sides by dividing individual terms, and then isolate for B:  $$1.4589 \times 10^{-7}B > 1.7476 \times 10^{-6} + 5.3333 \times 10^{-10}B$$$$B > \frac{1.7476 \times 10^{-6}}{1.4536 \times 10^{-7}}$$
+	- Simplify both sides by dividing individual terms, and then isolate for B:  
+	- Coming to: $$1.4589 \times 10^{-7}B > 1.7476 \times 10^{-6} + 5.3333 \times 10^{-10}B$$
+	- $$B > \frac{1.7476 \times 10^{-6}}{1.4536 \times 10^{-7}}$$
 	1. Our required batch size needs to be: $$B > \mathbf{12.02}$$
 	2. A side note: If you're curious about why we're running these hypothetical scenarios where we run entirely 'out of VMEM', that makes sense, because VMEM is, in reality only a few dozen MB at best (but much faster than HBM) while HBM is several dozen GB at least. 'Running out of VMEM' is a scenario where we experience perfect, unthrottled streaming speed done with a technique called prefetching. When we load Chunk A from our HBM into our VMEM, while the MXU is performing, the memory controller is already pulling Chunk B out of HBM so the MXU can instantly move to the next Chunk without waiting. This 'perfect prefetching scenario' means we completely mask the HBM delay so we can see how the chip acts when it's not lacking data.
 ### Question 4b [Accounting for Practical Contention]
