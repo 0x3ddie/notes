@@ -1,6 +1,5 @@
 ---
 title: All about TPUs
-description: Overview and Worked Problems
 published: true
 ---
 ## How TPUs Work
@@ -310,13 +309,17 @@ Let's scale up to Google's newer **TPU v6e** architecture. A team wants to run a
 - **Architectural Baseline:** The v6e internal VMEM-to-MXU bus features a design factor of exactly **$24\times$** the local HBM bandwidth.
 
  **The Task:** 
-1. Calculate the raw theoretical VMEM bandwidth for the TPU v6e. $$\text{VMEM Bandwidth} = 24 \times (1.60 \times 10^{12} \text{ bytes/s}) = \mathbf{3.84 \times 10^{13} \text{ bytes/s}}$$
+1. Calculate the raw theoretical VMEM bandwidth for the TPU v6e. 
+	- $$\text{VMEM Bandwidth} = 24 \times (1.60 \times 10^{12} \text{ bytes/s}) = \mathbf{3.84 \times 10^{13} \text{ bytes/s}}$$
 2. Assuming the arrays are resident in VMEM, derive the minimum token batch size ($B$) required to cross the critical intensity threshold and become completely compute-bound.
-	1. Int8 means 1 byte per element. We know our 2BDF operations (2 x B x 16384 x 4096) and our BD DF BF network transfers. Clearly our weight matrix is given as 16384 x 4096, and our B is unknown.  Then we just want to put each respective total over their peak compute and peak HBM bandwidth to find compute-bound batch size for HBM, or swap out HBM for VMEM respectively. We're already given our Peak Compute Speed, so we need to find our total int8 OPs and total traffic: $$\text{Total Storage Traffic Bytes} = 67,108,864 + 4,096B + 16,384B = \mathbf{67,108,864 + 20,480B \text{ bytes}}$$$$\text{Total INT8 OPs} = 2 \times B \times 16384 \times 4096 = \mathbf{134,217,728B}$$
-	2. Set up our inequality equation: $$\frac{134,217,728B}{9.20 \times 10^{14}} > \frac{67,108,864 + 20,480B}{3.84 \times 10^{13}}$$
-	3. Simplify both sides by dividing individual terms, and then isolate for B:$$1.4589 \times 10^{-7}B > 1.7476 \times 10^{-6} + 5.3333 \times 10^{-10}B$$$$B > \frac{1.7476 \times 10^{-6}}{1.4536 \times 10^{-7}}$$
-	4. Our required batch size needs to be:$$B > \mathbf{12.02}$$
-	5. A side note: If you're curious about why we're running these hypothetical scenarios where we run entirely 'out of VMEM', that makes sense, because VMEM is, in reality only a few dozen MB at best (but much faster than HBM) while HBM is several dozen GB at least. 'Running out of VMEM' is a scenario where we experience perfect, unthrottled streaming speed done with a technique called prefetching. When we load Chunk A from our HBM into our VMEM, while the MXU is performing, the memory controller is already pulling Chunk B out of HBM so the MXU can instantly move to the next Chunk without waiting. This 'perfect prefetching scenario' means we completely mask the HBM delay so we can see how the chip acts when it's not lacking data.
+	- Int8 means 1 byte per element. We know our 2BDF operations (2 x B x 16384 x 4096) and our BD DF BF network transfers. Clearly our weight matrix is given as 16384 x 4096, and our B is unknown.  Then we just want to put each respective total over their peak compute and peak HBM bandwidth to find compute-bound batch size for HBM, or swap out HBM for VMEM respectively. We're already given our Peak Compute Speed, so we need to find our total int8 OPs and total traffic: 
+	- $$\text{Total Storage Traffic Bytes} = 67,108,864 + 4,096B + 16,384B = \mathbf{67,108,864 + 20,480B \text{ bytes}}$$
+	- $$\text{Total INT8 OPs} = 2 \times B \times 16384 \times 4096 = \mathbf{134,217,728B}$$
+	- Set up our inequality equation: $$\frac{134,217,728B}{9.20 \times 10^{14}} > \frac{67,108,864 + 20,480B}{3.84 \times 10^{13}}$$
+	- Simplify both sides by dividing individual terms, and then isolate for B: 
+	- $$1.4589 \times 10^{-7}B > 1.7476 \times 10^{-6} + 5.3333 \times 10^{-10}B$$$$B > \frac{1.7476 \times 10^{-6}}{1.4536 \times 10^{-7}}$$
+	1. Our required batch size needs to be: $$B > \mathbf{12.02}$$
+	2. A side note: If you're curious about why we're running these hypothetical scenarios where we run entirely 'out of VMEM', that makes sense, because VMEM is, in reality only a few dozen MB at best (but much faster than HBM) while HBM is several dozen GB at least. 'Running out of VMEM' is a scenario where we experience perfect, unthrottled streaming speed done with a technique called prefetching. When we load Chunk A from our HBM into our VMEM, while the MXU is performing, the memory controller is already pulling Chunk B out of HBM so the MXU can instantly move to the next Chunk without waiting. This 'perfect prefetching scenario' means we completely mask the HBM delay so we can see how the chip acts when it's not lacking data.
 ### Question 4b [Accounting for Practical Contention]
 
 An engineering team is running the exact same TPU v5e configuration from your textbook (`int8[16384, 4096] × int8[B, 4096]`), utilizing a baseline single-chip HBM bandwidth of $8.2 \times 10^{11} \text{ bytes/s}$ and an `int8` compute ceiling of $3.94 \times 10^{14} \text{ OPs/s}$.
@@ -324,35 +327,49 @@ An engineering team is running the exact same TPU v5e configuration from your te
 However, instead of using the perfect theoretical multiplier of 22, the compiler team wants to account for real-world **bandwidth contention** (weights, activations, and outputs fighting for the internal bus lanes). They tell you to use the realistic practical factor of **$20\times$**.
 
 **The Task:** 
-1. Calculate the realistic, practical VMEM bandwidth under contention.
+- Calculate the realistic, practical VMEM bandwidth under contention.
 	- $$\text{Practical VMEM Speed} = 20 \times (8.2 \times 10^{11} \text{ bytes/s}) = \mathbf{1.64 \times 10^{13} \text{ bytes/s}}$$
-2. Determine the new minimum batch size ($B$) needed to saturate the execution pipelines under these real-world conditions. Compare it to the theoretical boundary ($B > 11$) to see how contention shifts your operational requirements.
+- Determine the new minimum batch size ($B$) needed to saturate the execution pipelines under these real-world conditions. Compare it to the theoretical boundary ($B > 11$) to see how contention shifts your operational requirements.
 	- $$\frac{134,217,728B}{3.94 \times 10^{14}} > \frac{67,108,864 + 20,480B}{1.64 \times 10^{13}}$$
 
-$$3.4065 \times 10^{-7}B > 4.0920 \times 10^{-6} + 1.2488 \times 10^{-9}B$$
+	- $$3.4065 \times 10^{-7}B > 4.0920 \times 10^{-6} + 1.2488 \times 10^{-9}B$$
 
-$$3.3940 \times 10^{-7}B > 4.0920 \times 10^{-6}$$
+	- $$3.3940 \times 10^{-7}B > 4.0920 \times 10^{-6}$$
 
-$$B > 12.06 \implies \mathbf{B \ge 13 \text{ tokens}}$$
+	- $$B > 12.06 \implies \mathbf{B \ge 13 \text{ tokens}}$$
 	- Because of shared bus lane overheads, our theoretical token concurrency shifts from a theoretical B > 11 to a B > 13 tokens to fully mask memory latency. 
 	- What does B > x mean? For users, smaller x this means less time to first token (TFTT) since we don't have to wait for other users tokens to finish processing. For engineers, larger x means more hardware utilization and better efficiency. The trick is to have this equilibrium between low TFTT and maximum hardware utilization (so not to waste money through starvation cycles). 
 
 **Question 5 [ICI bandwidth]:** Let’s say we have a TPU v5e `4x4` slice. Let’s say we want to send an array of type `bf16[8, 128, 8192]` from `TPU{0,0}` to `TPU{3, 3}`. Let’s say the per-hop latency for TPU v5e is 1μs.
 
 1. How soon will the first byte arrive at its destination?
-	1. In a standard 16x16 pod, the outer edges have physical wraparound cables. But paying attention to the word slice means our 4x4 is just a smaller cluster, a subspace of the larger grid that behaves as a flat 2D mesh, not Torus. Travelling from 0,0 to 3,3 in a Mesh means we go up by 3, and then go horizontal by 3, so 6 hops total, or 6μs.
+	- In a standard 16x16 pod, the outer edges have physical wraparound cables. But paying attention to the word slice means our 4x4 is just a smaller cluster, a subspace of the larger grid that behaves as a flat 2D mesh, not Torus. Travelling from 0,0 to 3,3 in a Mesh means we go up by 3, and then go horizontal by 3, so 6 hops total, or 6μs.
 2. How long will the total transfer take?
-	1. Because this is a networking problem, we ignore the local math operations that we've done in prior problems. We only care about the physical volume of the tensor being sent between chips. So we have 8 x 128 x 8192 x 2(bf16) = 1.7e7 bytes. If we send this entire package over a single pipe, 1.7e7/4.5e10 = 372~ microseconds. But, with how ICI is configured, and how we can travel bidirectionally (half the packet travels vertically to 3,3, the other half starts horizontally to 3,3), that speed can be halved to 186 microseconds, plus the 6 microseconds for our hop latency, so 192 microseconds.
+	- Because this is a networking problem, we ignore the local math operations that we've done in prior problems. We only care about the physical volume of the tensor being sent between chips. So we have 8 x 128 x 8192 x 2(bf16) = 1.7e7 bytes. If we send this entire package over a single pipe, 1.7e7/4.5e10 = 372~ microseconds. But, with how ICI is configured, and how we can travel bidirectionally (half the packet travels vertically to 3,3, the other half starts horizontally to 3,3), that speed can be halved to 186 microseconds, plus the 6 microseconds for our hop latency, so 192 microseconds.
 
 **Question 5a [Next-Gen TPU v6e Cordon Topology]:** A bf16[16, 256, 4096] tensor must be routed from coordinate (0,0) to (7,7) inside an isolated 8x8 slice of TPU v6e chips. The architecture features a per-hop routing delay of $0.8 \ \mu\text{s}$ and an individual interconnect link bandwidth of $1.0 \times 10^{11} \text{ bytes/s}$. Wrap-around torus connections are disabled for partitions under a 16-chip axis length.
 1. Calculate the First Byte Arrival Time based on flat 2D mesh hop geometry.
-	1. 
+	- Starting at 0,0, it would take us 14 total hops (7 up, 7 horizontal) to get to 7,7. 14 hops x 0.8 microseconds = 11.2 microseconds. 
 2. Calculate the Total Transfer Time assuming the data footprint is split equally across two active routing ports simultaneously.
-	1. 
+	- We only care about sending the whole tensor from A to B. Our total bytes to stream are 2 x 16 x 256 x 4096, or 33,554,432 bytes. Remembering that we use 2 pipes instead of 1 (bi-directional), our ICI bandwidth essentially doubles to 2.0e11 bytes. 
+	- $$\text{Serialization Time} = \frac{33,554,432 \text{ bytes}}{2.0 \times 10^{11} \text{ bytes/s}} = 0.00016777 \text{ seconds} = \mathbf{167.8 \ \mu\text{s}}$$
+	- $$\text{Total Transfer Time} = 167.8 \ \mu\text{s} + 11.2 \ \mu\text{s} = \mathbf{179.0 \ \mu\text{s}}$$
 
 **Question 5b [Asymmetric Rectangular Slice Routing]:** A bf16[4, 512, 2048] tensor is transmitted across a rectangular 4x8 sub-slice of TPU v5e chips from coordinate (0,0) to (3,7). The grid lacks wrap-around connections on both axes. Each interconnect channel features a link bandwidth of $4.5 \times 10^{10} \text{ bytes/s}$ and a fixed router delay of $1.0 \ \mu\text{s}$ per hop.
 1. Calculate the First Byte Arrival Time.
+	- From 0,0 to 3,7 we'll travel 10 hops, first byte arrives in 10 microseconds.
 2. Determine the Total Transfer Time utilizing dual-port parallel streaming out of the source coordinate.
+	- Total bytes: 2 x 4 x 512 x 2048 = 8,388,608 bytes. 
+	- Total ICI bandwidth (given x2 because bidirectional pipes): 9.0e10 bytes
+	- $$\text{Total Transfer Time} = 93.2 \ \mu\text{s} + 10.0 \ \mu\text{s} = \mathbf{103.2 \ \mu\text{s}}$$
+
+**Question 6 [pulling it all together, hard]:** Imagine you have a big matrix **A**: `int8[128 * 1024, 128 * 1024]` sharded evenly across a TPU v5e 4x4 slice but offloaded to host DRAM on each chip. Let’s say you want to copy the entire array to TPU{0, 0} and multiply it by a vector `bf16[8, 128 * 1024]`. How long will this take? _Hint: use the numbers above._
+- Basically our matrix dimensions are int8 A[131072,131072]. This means we have 131072 x 131072 x 1 bytes, or 17,179,869,184 bytes, simplified to 16GB.
+- We also need to pay attention to the wording here. Offloading to the host DRAM means that we're not sitting in HBM, but each chips portion of the matrix sits in the CPU's DRAM, which involves travelling from the Host CPU DRAM to the local TPU through the PCIe bus lanes. So, Each host basically has 1/2 of the total matrix, which is shared to each individual TPU through PCIe. 
+- So, when we want to copy the entire array to TPU 0,0, we take all the shards that travel across the ICI network cables from the other 15 chips. Each chip, having 1/16 of the entire matrix, would be shard width (131072/4) and shard height (131072/4) = 32768. So each chip holds a [32768,32768] matrix (1/4 of the height, 1/4 of the width = 1/16 of the total matrix).
+- According to our references, a v5e host size is 4x2, or 8 chips. For our 16 chip slice, we have 2 CPU hosts. 
+- We have 3 core steps, starting with the PCIe loading from Host DRAM to the 16 TPUs. All 16 TPUs simultaneously open PCIe gates and pull their respective 1GB shards into their local HBM. 1.074e9 bytes transferred over the PCIe bandwidth of 1.6e10 bytes comes to around 67 microseconds. Each chip does this in parallel.
+
 ## Reference Numbers
 
 Here are some specific numbers for our chips:
