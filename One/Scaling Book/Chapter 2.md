@@ -316,8 +316,7 @@ Let's scale up to Google's newer **TPU v6e** architecture. A team wants to run a
 	- $$\text{Total Storage Traffic Bytes} = 67,108,864 + 4,096B + 16,384B = \mathbf{67,108,864 + 20,480B \text{ bytes}}$$
 	- $$\text{Total INT8 OPs} = 2 \times B \times 16384 \times 4096 = \mathbf{134,217,728B}$$
 	- Set up our inequality equation: $$\frac{134,217,728B}{9.20 \times 10^{14}} > \frac{67,108,864 + 20,480B}{3.84 \times 10^{13}}$$
-	- Simplify both sides by dividing individual terms, and then isolate for B: 
-	- $$1.4589 \times 10^{-7}B > 1.7476 \times 10^{-6} + 5.3333 \times 10^{-10}B$$$$B > \frac{1.7476 \times 10^{-6}}{1.4536 \times 10^{-7}}$$
+	- Simplify both sides by dividing individual terms, and then isolate for B:  $$1.4589 \times 10^{-7}B > 1.7476 \times 10^{-6} + 5.3333 \times 10^{-10}B$$$$B > \frac{1.7476 \times 10^{-6}}{1.4536 \times 10^{-7}}$$
 	1. Our required batch size needs to be: $$B > \mathbf{12.02}$$
 	2. A side note: If you're curious about why we're running these hypothetical scenarios where we run entirely 'out of VMEM', that makes sense, because VMEM is, in reality only a few dozen MB at best (but much faster than HBM) while HBM is several dozen GB at least. 'Running out of VMEM' is a scenario where we experience perfect, unthrottled streaming speed done with a technique called prefetching. When we load Chunk A from our HBM into our VMEM, while the MXU is performing, the memory controller is already pulling Chunk B out of HBM so the MXU can instantly move to the next Chunk without waiting. This 'perfect prefetching scenario' means we completely mask the HBM delay so we can see how the chip acts when it's not lacking data.
 ### Question 4b [Accounting for Practical Contention]
@@ -368,7 +367,12 @@ However, instead of using the perfect theoretical multiplier of 22, the compiler
 - We also need to pay attention to the wording here. Offloading to the host DRAM means that we're not sitting in HBM, but each chips portion of the matrix sits in the CPU's DRAM, which involves travelling from the Host CPU DRAM to the local TPU through the PCIe bus lanes. So, Each host basically has 1/2 of the total matrix, which is shared to each individual TPU through PCIe. 
 - So, when we want to copy the entire array to TPU 0,0, we take all the shards that travel across the ICI network cables from the other 15 chips. Each chip, having 1/16 of the entire matrix, would be shard width (131072/4) and shard height (131072/4) = 32768. So each chip holds a [32768,32768] matrix (1/4 of the height, 1/4 of the width = 1/16 of the total matrix).
 - According to our references, a v5e host size is 4x2, or 8 chips. For our 16 chip slice, we have 2 CPU hosts. 
-- We have 3 core steps, starting with the PCIe loading from Host DRAM to the 16 TPUs. All 16 TPUs simultaneously open PCIe gates and pull their respective 1GB shards into their local HBM. 1.074e9 bytes transferred over the PCIe bandwidth of 1.6e10 bytes comes to around 67 microseconds. Each chip does this in parallel.
+- We have 3 core steps, starting with the PCIe loading from Host DRAM to the 16 TPUs. All 16 TPUs simultaneously open PCIe gates and pull their respective 1GB shards into their local HBM. 1.074e9 bytes transferred over the PCIe bandwidth of 1.6e10 bytes comes to around 67 ms. Each chip does this in parallel.
+- In practice, going from 3,3 to 0,0 introduces our TPUs at 0,1 and 0,2 etc as bottlenecks as they also have to catch and forward the shards coming from all previous TPUs. Traffic logically gets denser the closer we get to 0,0. However, we can just average this out and assume that we're sending 15GB over our ICI bandwidth of 9.0e10 (bidirectional) which comes to around 167ms. 
+- We've finished the network portion so now for the inner-chip movement from HBM to MXU, we need to load our bytes from HBM to MXU. So, 16GB / 8.2e11 (HBM Bandwidth) = 20ms.
+- We need to finally do our actual math in the MXU, multiplying our Matrix A by our Vector X. 
+- Note: The 2JBM FLOPs formula tells us that when we multiply a matrix of shake [M,K] by a matrix of shape [K,N], the total FLOPs is 2xMxKxN. This comes to:$$\text{Total FLOPs} = 2 \times \underbrace{\vphantom{12}8}_{M} \times \underbrace{(128 \times 1024)}_{K} \times \underbrace{(128 \times 1024)}_{N}$$
+- Resulting in 2.7e11 FLOPs / 1.97e14 bf16 FLOPs/s, comes to 1.4ms. 
 
 ## Reference Numbers
 
