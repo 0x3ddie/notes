@@ -122,5 +122,19 @@ To conclude on sharding: There are 4 main communication primitives that define h
 - Notice that we now have a Z axis for our TPU cluster, yet our rows are only sharded across X and Y. Meaning, I is split along the X and Y axis, but replicated along the Z axis, so it's only split 16 ways. 
 - 128/16 = 8 rows, 2048 columns for each TPU. Memory used per device will be 1 x 8 x 2048 bytes, 16384 bytes. Total memory across devices is 16384 x 32, or 524288 bytes.
 
+**Pop Quiz 2 [AllGather time]:** Using the numbers from Part 2, how long does it take to perform the $\text{AllGather}_Y([E_Y, F]) \rightarrow [E, F]$ on a TPU v5e with a 2D mesh `{'X': 8, 'Y': 4}`, where $E = 2048, F = 8192$ in bfloat16? What about with $E = 256, F = 256$?
+
+* **Hardware Reference Values:**
+  * Unidirectional ICI Axis Bandwidth: $4.5 \times 10^{10} \text{ bytes/s}$
+  * Per-Hop Router Processing Latency: $1.0 \ \mu\text{s}$
+  * Boundary Constraint: No torus wrap-around connections for axis lengths under 16 chips.
+
+* **Part 1 Matrix Configuration ($E = 2048, F = 8192$):**
+  $$\text{Local Shard Shape} = \text{bf16}[512, 8192] \rightarrow 512 \times 8192 \times 2 \text{ bytes} \approx 8.4\text{ MB}$$
+  $$\text{Unified Array Size} = \text{bf16}[2048, 8192] \rightarrow 2048 \times 8192 \times 2 \text{ bytes} \approx 33.55\text{ MB}$$
+
+* **Part 2 Matrix Configuration ($E = 256, F = 256$):**
+  $$\text{Local Shard Shape} = \text{bf16}[64, 256] \rightarrow 64 \times 256 \times 2 \text{ bytes} = 32,768\text{ bytes}$$
+
 **Question 1 [replicated sharding]**: An array is sharded A[IX,J,K,…]A[IX​,J,K,…] (i.e., only sharded across X), with a mesh `Mesh({'X': 4, 'Y': 8, 'Z': 2})`. What is the ratio of the total number of bytes taken up by AA across all chips to the size of one copy of the array?
 
