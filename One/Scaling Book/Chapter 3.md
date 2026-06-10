@@ -28,7 +28,6 @@ A 1D shard, like $I_x,Y$, duplicates data since each device holds full columns. 
 
 If we write a fully-replicated form of the matrix as $A[I,J]$, we don’t assign shards and each device has a full copy of the entire matrix.
 
-![[Pasted image 20260610152540.png]]
 
 This is where using JAX comes into play; the named sharding system is very similar to the abstract syntax we’ve been using above. You can use a Colab notebook to try TPUs for free:
 
@@ -111,15 +110,17 @@ AlltoAll is purely a rearrangement primitive, and is $\frac{1}{4}$ the cost of a
 To conclude on sharding: There are 4 main communication primitives that define how shards move in pods. In some cases, we might not need to shard at all if our matrices are complete (Case 1), but most cases, and all cases in production environments, will require sharding due to massive sizes and arrays. Many of the cases we described are very rudimentary use cases involving 4, 8 TPUs and some tiny matrices. What about 4000 TPUs? The scale is honestly staggering, so understanding simple concepts like how shards move along ICI to result in final, complete matrices, and which primitive to use or discard to optimize can drastically reduce network and memory latency.
 
 ### Problem Set
+
 **Pop Quiz [2D sharding across 1 axis]:** Consider an array `fp32[1024, 4096]` with sharding A[I XY,J] and mesh `{'X': 8, 'Y': 2}`. How much data is held by each device? How much time would it take to load this array from HBM on H100s (assuming `3.4e12` memory bandwidth per chip)?
 - Our Mesh means we have an 8x2 grid setup of TPUs, or 16 TPUs total. 
 - Our array is fp32, so the total bytesize is 4x1024x4096 = 
 - We're told that our array A [I,J] has [I] sharded across X and Y, and J is untouched. This tells us that each individual TPU gets 100% of the columns J and 1/16 of the rows I. 1024/16 = 64, so each TPU gets [64,4096]. Total elements comes to 262,144, x4 = 1048576 bytes.
 - $$\text{HBM Load Time} = \frac{1,048,576 \text{ bytes}}{3.4 \times 10^{12} \text{ bytes/s}}$$
-- Which gives us .308 microseconds, or 308 nanoseconds.
+- .308 microseconds, or 308 nanoseconds.
 
-**Pop Quiz:** Let **A** be an array with shape `int8[128, 2048]`, sharding A[IXY,J]A[IXY​,J], and mesh `Mesh({'X': 2, 'Y': 8, 'Z': 2})` (so 32 devices total). How much memory does **A** use per device? How much total memory does **A** use across all devices?
-- 
+**Pop Quiz:** Let **A** be an array with shape `int8[128, 2048]`, sharding A[IXY​,J], and mesh `Mesh({'X': 2, 'Y': 8, 'Z': 2})` (so 32 devices total). How much memory does **A** use per device? How much total memory does **A** use across all devices?
+- Notice that we now have a Z axis for our TPU cluster, yet our rows are only sharded across X and Y. Meaning, I is split along the X and Y axis, but replicated along the Z axis, so it's only split 16 ways. 
+- 128/16 = 8 rows, 2048 columns for each TPU. Memory used per device will be 1 x 8 x 2048 bytes, 16384 bytes. Total memory across devices is 16384 x 32, or 524288 bytes.
 
 **Question 1 [replicated sharding]**: An array is sharded A[IX,J,K,…]A[IX​,J,K,…] (i.e., only sharded across X), with a mesh `Mesh({'X': 4, 'Y': 8, 'Z': 2})`. What is the ratio of the total number of bytes taken up by AA across all chips to the size of one copy of the array?
 
