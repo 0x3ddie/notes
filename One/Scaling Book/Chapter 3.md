@@ -1,6 +1,5 @@
 ---
 title: Sharded Matrices and How to Multiply Them
-description: Overview and Worked Problems
 published: true
 ---
 ## 3. Sharding Matrices
@@ -110,3 +109,9 @@ AlltoAll is purely a rearrangement primitive, and is $\frac{1}{4}$ the cost of a
 To conclude on sharding: There are 4 main communication primitives that define how shards move in pods. In some cases, we might not need to shard at all if our matrices are complete (Case 1), but most cases, and all cases in production environments, will require sharding due to massive sizes and arrays. Many of the cases we described are very rudimentary use cases involving 4, 8 TPUs and some tiny matrices. What about 4000 TPUs? The scale is honestly staggering, so understanding simple concepts like how shards move along ICI to result in final, complete matrices, and which primitive to use or discard to optimize can drastically reduce network and memory latency.
 
 ### Problem Set
+**Pop Quiz [2D sharding across 1 axis]:** Consider an array `fp32[1024, 4096]` with sharding A[IXY,J]A[IXY​,J] and mesh `{'X': 8, 'Y': 2}`. How much data is held by each device? How much time would it take to load this array from HBM on H100s (assuming `3.4e12` memory bandwidth per chip)?
+- Our Mesh means we have an 8x2 grid setup of TPUs, or 16 TPUs total. 
+- Our array is fp32, so the total bytesize is 4x1025x4096 = 
+
+**Question 1 [replicated sharding]**: An array is sharded A[IX,J,K,…]A[IX​,J,K,…] (i.e., only sharded across X), with a mesh `Mesh({'X': 4, 'Y': 8, 'Z': 2})`. What is the ratio of the total number of bytes taken up by AA across all chips to the size of one copy of the array?
+
