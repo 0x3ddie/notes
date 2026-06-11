@@ -130,11 +130,15 @@ To conclude on sharding: There are 4 main communication primitives that define h
   * Boundary Constraint: No torus wrap-around connections for axis lengths under 16 chips.
 
 * **Part 1 Matrix Configuration ($E = 2048, F = 8192$):**
-  $$\text{Local Shard Shape} = \text{bf16}[512, 8192] \rightarrow 512 \times 8192 \times 2 \text{ bytes} \approx 8.4\text{ MB}$$
-  $$\text{Unified Array Size} = \text{bf16}[2048, 8192] \rightarrow 2048 \times 8192 \times 2 \text{ bytes} \approx 33.55\text{ MB}$$
-
-* **Part 2 Matrix Configuration ($E = 256, F = 256$):**
-  $$\text{Local Shard Shape} = \text{bf16}[64, 256] \rightarrow 64 \times 256 \times 2 \text{ bytes} = 32,768\text{ bytes}$$
+	* We have 32 TPUs in a grid that is 8 chips wide and 4 chips tall, so 8 columns. Our AllGatherY operation means that all our chips only pass data to their vertical neighbors. This might be a bit confusing, but we have our normal TPU configurations but the operation itself concerns each chip and their vertical neighbors. So our AllGatherY operation means that our chips just move along the vertical line instead of towards everybody else. And as we gather all our shards 'vertically' it should come together as a complete E.
+	* This is where we need to look at the mesh configurations too. Because its a 2D flat mesh, there's no wraparound cable that connects the 'bottom' chip directly to the top chip that you would see in a 3D Torus config with wraparound cables. Meaning, we're throttled by the bottom chip that needs to travel through the other chips vertically. So we're stuck with unidirectional ICI bandwidth.
+	-  $$\text{Local Shard Shape} = \text{bf16}[512, 8192] \rightarrow 512 \times 8192 \times 2 \text{ bytes} \approx 8.4\text{ MB}$$
+	- Each local shard is 8.4MB, and since we have 4 chips per Y, we split the E row by 4, so 512 elements. That means that for all 8 of our rows, we eventually end up with 8 identical arrays of a finished A[E,F]. We can imagine the shard at the bottom of each column travelling through 3 more chips to get to the top for the AllGather, since we're forced to be unidirectional. Hopping 3 times means:
+	- $$\text{T}_{\text{comms}} = \frac{3 \times 8.4 \times 10^6 \text{ bytes}}{4.5 \times 10^{10} \text{ bytes/s}} = \mathbf{560 \ \mu\text{s}}$$
+	- Plus 3 microseconds for our per-hop processing latency.
+	- $$\text{Unified Array Size} = \text{bf16}[2048, 8192] \rightarrow 2048 \times 8192 \times 2 \text{ bytes} \approx 33.55\text{ MB}$$
+	- If we change our E = 256 and F = 256, $$\text{Streaming term} = \frac{32 \times 10^3 \text{ bytes}}{4.5 \times 10^{10} \text{ bytes/s}} = 0.7 \text{ ns} \rightarrow \text{Negligible}$$
+	- Meaning we're latency-bound with our 3 microsecond hop latency as a minimum.
 
 **Question 1 [replicated sharding]**: An array is sharded A[IX,J,K,…]A[IX​,J,K,…] (i.e., only sharded across X), with a mesh `Mesh({'X': 4, 'Y': 8, 'Z': 2})`. What is the ratio of the total number of bytes taken up by AA across all chips to the size of one copy of the array?
 
