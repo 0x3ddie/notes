@@ -123,12 +123,6 @@ To conclude on sharding: There are 4 main communication primitives that define h
 - 128/16 = 8 rows, 2048 columns for each TPU. Memory used per device will be 1 x 8 x 2048 bytes, 16384 bytes. Total memory across devices is 16384 x 32, or 524288 bytes.
 
 **Pop Quiz 2 [AllGather time]:** Using the numbers from Part 2, how long does it take to perform the $\text{AllGather}_Y([E_Y, F]) \rightarrow [E, F]$ on a TPU v5e with a 2D mesh `{'X': 8, 'Y': 4}`, where $E = 2048, F = 8192$ in bfloat16? What about with $E = 256, F = 256$?
-
-* **Hardware Reference Values:**
-  * Unidirectional ICI Axis Bandwidth: $4.5 \times 10^{10} \text{ bytes/s}$
-  * Per-Hop Router Processing Latency: $1.0 \ \mu\text{s}$
-  * Boundary Constraint: No torus wrap-around connections for axis lengths under 16 chips.
-
 * **Part 1 Matrix Configuration ($E = 2048, F = 8192$):**
 	* We have 32 TPUs in a grid that is 8 chips wide and 4 chips tall, so 8 columns. Our AllGatherY operation means that all our chips only pass data to their vertical neighbors. This might be a bit confusing, but we have our normal TPU configurations but the operation itself concerns each chip and their vertical neighbors. So our AllGatherY operation means that our chips just move along the vertical line instead of towards everybody else. And as we gather all our shards 'vertically' it should come together as a complete E.
 	* This is where we need to look at the mesh configurations too. Because its a 2D flat mesh, there's no wraparound cable that connects the 'bottom' chip directly to the top chip that you would see in a 3D Torus config with wraparound cables. Meaning, we're throttled by the bottom chip that needs to travel through the other chips vertically. So we're stuck with unidirectional ICI bandwidth.
@@ -140,5 +134,34 @@ To conclude on sharding: There are 4 main communication primitives that define h
 	- If we change our E = 256 and F = 256, $$\text{Streaming term} = \frac{32 \times 10^3 \text{ bytes}}{4.5 \times 10^{10} \text{ bytes/s}} = 0.7 \text{ ns} \rightarrow \text{Negligible}$$
 	- Meaning we're latency-bound with our 3 microsecond hop latency as a minimum.
 
-**Question 1 [replicated sharding]**: An array is sharded A[IX,J,K,…]A[IX​,J,K,…] (i.e., only sharded across X), with a mesh `Mesh({'X': 4, 'Y': 8, 'Z': 2})`. What is the ratio of the total number of bytes taken up by AA across all chips to the size of one copy of the array?
+**Question 1 [replicated sharding]**: An array is sharded A[IX​,J,K,…] (i.e., only sharded across X), with a mesh `Mesh({'X': 4, 'Y': 8, 'Z': 2})`. What is the ratio of the total number of bytes taken up by A across all chips to the size of one copy of the array?
+- We see that our mesh describes a 3D configuration of 64 TPUs.
+- Our array's I dimension is sharded across X, while J and K are unsharded. So, each chip gets A[I/4, J, K]. 
+- In order to get the full array, we need 4 chips, or 1 horizontal line of chips. 64/4=16, meaning we have 16 copies of our completed A.
+- What this means: our total memory consumed across 64 TPUs is 16 times larger than the raw unsharded tensor because we're storing 16 completed replicas.
 
+**1a: 2D Sharding on a 3D Mesh**: Consider an weight matrix $W$ with dimensions `fp32[4096, 4096]`. It is sharded as $W[I_X, J_Z]$ (meaning the rows are sharded across $X$, the columns are sharded across $Z$, and $Y$ is left out).
+
+The hardware configuration is `Mesh({'X': 4, 'Y': 4, 'Z': 4})`.
+**How much memory does a single shard take up on an individual device?**
+- Total elements is 4096 x 4096, bytes would be x4 so 64MB.
+- We shard our rows and columns along the X and Z axis respectively, so each device gets 1024x1024 elements, or 4MB.
+**What is the ratio of the total memory used across the whole cluster to the size of one un-sharded copy of the array?**
+- We're sharding across X and Z but replicating along Y. So, for every 4 X and Z chips, we get 1 complete shard (but Y is replicated 4 times).
+- $$\text{Ratio} = \frac{64 \text{ devices} \times 4 \text{ MiB per device}}{64 \text{ MiB for 1 copy}} = \frac{256 \text{ MiB}}{64 \text{ MiB}} = \mathbf{4}$$
+
+**1b: The Multi-Axis Shard Trap:** Consider an activation tensor $X$ with dimensions `bf16[8, 2048, 4096]`. It is sharded as $X[I_{XY}, J, K]$ (meaning only the first dimension $I$ is sharded, but it is split across _both_ the $X$ and $Y$ hardware axes simultaneously).
+
+The hardware configuration is `Mesh({'X': 2, 'Y': 8, 'Z': 4})`.
+**How much memory does a single shard take up on an individual device?**
+- Because we shard I along X and Y, we end up with I/16. Meaning, each shard gets 0.5 of an I element, or 1 byte. 
+	- FYI: This goes into fractional sharding. Physically we cannot hold half of a matrix element, so we 'pad' the dimension I out to the nearest multiple of the mesh size. So 8 would become 16. 8 of our chips hold 1 real row element, while the other 8 hold a dummy padded 0 row. The effective dimension I per device becomes 1 element.
+- $$\text{Elements per Device} = 1 \times 2048 \times 4096 = 8,388,608 \text{ elements}$$
+
+- $$\text{Memory per Device} = 8,388,608 \times 2 \text{ bytes} = \mathbf{16,777,216 \text{ bytes}} \ (16 \text{ MiB})$$
+**What is the ratio of the total memory used across the whole cluster to the size of one un-sharded copy of the array?**
+- $$\text{Total Cluster Memory} = 64 \text{ devices} \times 16 \text{ MiB/device} = \mathbf{1,024 \text{ MiB}} \ (1 \text{ GiB})$$
+
+- $$\text{Ratio} = \frac{1024 \text{ MiB}}{128 \text{ MiB}} = \mathbf{8}$$
+**Question 2 [AllGather / AllReduce latency]:** How long should $\text{AllGather}_X([B_X, D_Y])$ take on a TPU v4p $4 \times 4 \times 4$ slice with mesh `Mesh({'X': 4, 'Y': 4, 'Z': 4})` if $B = 1024$ and $D = 4096$ in bfloat16? How about $\text{AllGather}_{XY}([B_X, D_Y])$? How about $\text{AllReduce}_Z([B_X, D_Y]\{U_Z\})$?
+- 
