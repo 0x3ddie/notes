@@ -4,122 +4,87 @@ published: true
 ---
 ## 12. Thinking About GPUs
 
-Chapter 2 ended with a short "TPUs vs. GPUs" section: GPUs talk through switches, TPUs through a torus. This chapter is the long version of that for NVIDIA GPUs (mostly the H100 and B200): the chip, then the network, then the collectives from Chapter 3 and the training rooflines from Chapter 5 redone on a GPU cluster.
+This chapter redoes Chapters 2, 3 and 5 for NVIDIA GPUs (mostly the H100 and B200): the chip, the network, the collectives, and the training rooflines.
 
-At the chip level a GPU and a TPU look surprisingly similar: a lot of matmul hardware sitting next to a stick of HBM. The difference is how the compute is cut up. A TPU has 1 or 2 big TensorCores. A GPU has over a hundred small, mostly independent cores called **Streaming Multiprocessors (SMs)**: 132 on an H100 and 148 on a B200.
+At the chip level a GPU looks a lot like a TPU: matmul hardware next to a stick of HBM. The difference is how the compute is cut up. Instead of 1 or 2 big TensorCores, a GPU has over a hundred small, mostly independent **Streaming Multiprocessors (SMs)**: 132 on an H100, 148 on a B200. The SM is the GPU's version of a TensorCore, and it has 4 quarters (subpartitions), each with:
 
-Every SM is cut into 4 equal quarters (subpartitions, in NVIDIA's terms), and each one has:
+- **Tensor Core:** The matmul unit, so the GPU's MXU (confusingly NOT the equivalent of a TPU TensorCore). Almost all the FLOPs/s live here: 990 TFLOPs/s in bf16 on an H100, against about 67 TFLOPs/s from the vector units.
 
-- **Tensor Core:** The matmul unit, so the GPU's version of the MXU. Confusingly it is NOT the equivalent of a TPU TensorCore (that would be the whole SM). Nearly all of the chip's FLOPs/s come from here: 990 TFLOPs/s in bf16 on an H100, against about 67 TFLOPs/s from the vector units.
+- **CUDA Cores:** 32 fp32 ALUs for vector math (ReLUs, pointwise ops, sums), like the lanes of the TPU's VPU. All 32 run the same instruction each cycle, fed by the Warp Scheduler.
 
-- **CUDA Cores:** 32 fp32 ALUs that do the vector math (ReLUs, pointwise ops, sums), like the lanes of the TPU's VPU. All 32 run the same instruction every cycle. The unit that feeds them work is the Warp Scheduler.
+- **Register file:** 16,384 32-bit registers for the CUDA cores (256kB per SM across the 4 quarters).
 
-- **Register file:** 16,384 32-bit registers for the CUDA cores.
-
-The names map onto Chapter 2 like this:
-
-|**GPU**|**TPU**|**What it is**|
-|---|---|---|
-|SM|TensorCore|The core "cell" that holds everything else|
-|Tensor Core|MXU|Matmul unit|
-|Warp Scheduler|VPU|SIMD vector unit|
-|CUDA Core|VPU ALU|One lane of the vector unit|
-|SMEM (L1 cache)|VMEM|Fast on-chip cache|
-|HBM|HBM|Big, slower main memory|
-
-The CUDA cores have more freedom than the lanes of a VPU. Each one carries its own instruction pointer (SIMT, Single Instruction Multiple Threads), so threads in the same group of 32 (a warp) can branch differently. The catch: the 32 cores still share one instruction per cycle, so the hardware runs the two branches one after the other while the cores on the other branch sit idle. Code that diverges a lot gets slower without any warning. An SM can also keep up to 64 warps loaded and run one while another waits on memory, while a TPU is basically single-threaded.
+The twist is SIMT (Single Instruction Multiple Threads): threads in a warp (a group of 32) can branch differently, but divergent branches still run one after the other. An SM also keeps up to 64 warps loaded and switches while one waits on memory; a TPU is basically single-threaded.
 
 ### GPU Memory
 
-There are more levels of memory than on a TPU. From closest to the math to furthest:
+- **SMEM:** 256kB of L1 cache per SM (the GPU's VMEM), holding the Tensor Core inputs. The B200 adds another 256kB of TMEM per SM to feed its bigger Tensor Cores.
 
-- **Registers:** 256kB per SM.
+- **L2 cache:** About 50MB on an H100, shared by every SM. Half the size of a TPU's VMEM, much slower (measured around 5.5 TB/s against roughly 40 TB/s for VMEM), and not under our control.
 
-- **SMEM:** 256kB of L1 cache per SM, holding the inputs for Tensor Core matmuls. The B200's Tensor Cores got big enough that it adds another 256kB of TMEM per SM just to feed them.
+- **HBM:** 80GB at 3.35 TB/s on an H100, 192GB at 8 TB/s on a B200.
 
-- **L2 cache:** About 50MB on an H100, shared by every SM. It's about half the size of a TPU's VMEM and far slower (the book cites a measurement of around 5.5 TB/s, against roughly 40 TB/s for VMEM), and we don't get to control what's in it.
-
-- **HBM:** 80GB at 3.35 TB/s on an H100, 192GB at 8 TB/s on a B200 (that's the book's spec table; its text says 9 TB/s).
-
-So what does the roofline from Chapter 1 look like? The H100's critical intensity for a bf16 matmul is 990e12/3.35e12, around 295 FLOPs/byte, and the B200's is around 281. A TPU v5e is 240. Meaning, the same rule of thumb carries over: a matmul needs a batch of a few hundred tokens before it's compute-bound. Lower precision buys throughput here too (fp8 is $2\times$ the fp16 FLOPs/s, and the B200 adds fp4 at roughly $4\times$).
+For the Chapter 1 roofline, the H100's bf16 critical intensity is around 295 FLOPs/byte and the B200's around 281, next to 240 for a TPU v5e. Meaning, a matmul still needs a batch of a few hundred tokens to be compute-bound.
 
 ### GPUs vs. TPUs at the Chip Level
 
-- **Modularity:** An H100 has $132 \times 4 = 528$ independent vector units, each 32 lanes wide. A TPU v5p has 8 units that are each 1,024 wide. Unrelated kernels can run side by side on different SMs with no planning. A TPU has one thread of control, so its compiler has to schedule the memory loads and the MXU and VPU work around each other by hand.
-
-- **Predictability:** The flip side. On a GPU a lot is settled while the program runs (what sits in the L2 cache, which warp goes next), so a kernel can be slow for reasons that never show up in the code. A TPU program is easier to push up to its roofline.
-
-- **Size:** A single GPU is a bigger chip. An H200 has around $2.2\times$ the FLOPs/s of a TPU v5p (9.9e14 against 4.59e14) and about $1.5\times$ the HBM. The TPU answer to that is more chips and a stronger network between them.
-
-- **Fast cache:** TPUs have far more of it: 128MB of VMEM on a v5p against 33MB of SMEM on an H100.
+An H100 has $132 \times 4 = 528$ independent vector units of 32 lanes, against 8 units of 1,024 on a TPU v5p. So a GPU is more modular (unrelated kernels can share it with no planning) but less predictable, since a lot gets decided at runtime (what's in L2, which warp goes next). A single GPU is also a bigger chip: an H200 has around $2.2\times$ the FLOPs/s of a v5p and about $1.5\times$ the HBM. TPUs answer with more chips, a stronger network, and far more fast cache (128MB of VMEM on a v5p against 33MB of SMEM on an H100).
 
 ## On GPU Networking
 
-This is where the two designs really split. GPUs sit at the bottom of a tree of switches. Any GPU can reach any other, but how much bandwidth it gets depends on how far up the tree the message has to climb.
+This is where the designs really split. GPUs sit at the bottom of a tree of switches: any GPU can reach any other, but the bandwidth depends on how far up the tree a message climbs.
 
-> **Note:** Two unit traps show up in every problem below. Network links are sold in bits (a 400 Gbps cable is 50 GB/s), and they're full-duplex, meaning the quoted number is available in each direction at the same time. Bisection bandwidth is the one figure that usually has both directions added together.
+> **Note:** Two unit traps in every problem below. Links are sold in bits (a 400 Gbps cable is 50 GB/s), and they're full-duplex, so the quoted number applies each way at once. Bisection bandwidth is the one figure that usually adds both directions.
 
 ### Inside a Node
 
-A **node** is a set of GPUs (8 for the H100 and B200) wired all-to-all through NVSwitches over NVLink. This is the telephone switchboard from Chapter 2. On an H100 node:
-
-- Each NVLink 4.0 link carries 25 GB/s each way.
-
-- Each GPU has 18 of them, spread over the node's 4 NVSwitches, so $18 \times 25 = 450\text{ GB/s}$ in and out of every GPU.
-
-- Each NVSwitch has 64 ports.
-
-The B200 doubles the link speed to 50 GB/s, so 900 GB/s per GPU.
+A **node** is 8 GPUs (H100 or B200) wired all-to-all through NVSwitches over NVLink, the telephone switchboard from Chapter 2. On an H100 each GPU has 18 NVLink 4.0 links at 25 GB/s each way, spread over the node's 4 NVSwitches (64 ports each), so $18 \times 25 = 450\text{ GB/s}$ in and out of every GPU. The B200 doubles the link speed to 50 GB/s, so 900 GB/s per GPU.
 
 ### Beyond the Node
 
-NVLink stops at the edge of the node. Past that, every GPU has its own 400 Gbps InfiniBand NIC, so a node of 8 has $8 \times 50 = 400\text{ GB/s}$ of egress in total. NVIDIA's reference H100 SuperPod stacks nodes up in two more levels:
+Past the node, every GPU has its own 400 Gbps InfiniBand NIC, so a node of 8 has $8 \times 50 = 400\text{ GB/s}$ of egress. NVIDIA's reference H100 SuperPod adds two levels of 64-port InfiniBand switches at 50 GB/s per port:
 
 - **Scalable Unit (SU):** 32 nodes (256 GPUs) under 8 leaf switches.
 
 - **SuperPod:** 4 SUs (1,024 GPUs) under 16 spine switches. Every leaf connects to every spine.
 
-All of these are 64-port InfiniBand switches at 50 GB/s per port. The layout is a **fat tree**: the cabling gets thicker towards the top (12.8 TB/s leaves each SU, 51.2 TB/s crosses the spine), so no level is a choke point and any node can send its full 400 GB/s to any other node. The diagrams on [jax-ml.github.io/scaling-book/gpus/](https://jax-ml.github.io/scaling-book/gpus/) are worth a look for this part.
+It's a **fat tree**: the cabling gets thicker towards the top (12.8 TB/s out of each SU, 51.2 TB/s across the spine), so any node can send its full 400 GB/s to any other node. The diagrams on [jax-ml.github.io/scaling-book/gpus/](https://jax-ml.github.io/scaling-book/gpus/) help a lot here.
 
-So there are two numbers to remember for an H100 cluster: **450 GB/s per GPU inside a node, 400 GB/s per node outside it.** That second one is only 50 GB/s per GPU, a $9\times$ drop the moment a message leaves the node. A TPU v5p, for comparison, has 6 links at 90 GB/s each (540 GB/s per chip) at any pod size, but only towards its neighbors.
+So two numbers to remember for an H100 cluster: **450 GB/s per GPU inside a node, 400 GB/s per node outside it.** That second one is only 50 GB/s per GPU, a $9\times$ drop the moment a message leaves the node. A TPU v5p has 540 GB/s per chip (6 links at 90 GB/s) at any pod size, but only to its neighbors.
 
-The GB200 NVL72 changes this by putting 72 GPUs in one NVLink domain at 900 GB/s each, with 3.6 TB/s of node egress. Since the chips are only about twice as fast, the cross-node rooflines below get roughly $4\times$ easier.
+The GB200 NVL72 puts 72 GPUs in one NVLink domain at 900 GB/s each, with 3.6 TB/s of node egress. The chips are only about twice as fast, so the cross-node rooflines below get roughly $4\times$ easier.
 
 ## Collectives on a Tree
 
-Same four primitives as Chapter 3, different cost model. On a torus every collective was "bytes over link bandwidth" wherever the chips sat; here the answer depends on whether we stay inside a node.
+Same four primitives as Chapter 3, but now the cost depends on whether we stay inside a node.
 
 ### Intra-node Collectives
 
-AllGather and ReduceScatter run around a ring exactly like on a TPU. Each of the $N - 1$ hops moves $\frac{1}{N}$ of the array at the full GPU egress:
+AllGather and ReduceScatter run around a ring like on a TPU. Each of the $N - 1$ hops moves $\frac{1}{N}$ of the array at full GPU egress:
 
 $$
 T_{\text{AG or RS}} = \frac{\text{bytes} \cdot (N - 1)}{N \cdot W_{\text{GPU}}} \approx \frac{\text{bytes}}{W_{\text{GPU}}}
 $$
 
-So about bytes/450e9 on an H100, and an AllReduce is still $2\times$ that.
-
-AllToAll is where the switch pays off. There's no ring to crawl around; every GPU sends each chunk straight to where it's going:
+So about bytes/450e9 on an H100, and an AllReduce is still $2\times$ that. AllToAll is where the switch pays off. No ring to crawl around; every GPU sends each chunk straight to its destination:
 
 $$
 T_{\text{AllToAll}} = \frac{\text{bytes} \cdot (N - 1)}{N^2 \cdot W_{\text{GPU}}} \approx \frac{\text{bytes}}{N \cdot W_{\text{GPU}}}
 $$
 
-On a torus this was $\text{bytes} / 4W$, so with $N = 8$ it's half the cost. For MoE routing, where only $k$ of the $N$ destinations receive anything, it shrinks by another $k/N$.
+On a torus this was $\text{bytes} / 4W$, so with $N = 8$ it's half the cost. For MoE routing, where only $k$ of the $N$ destinations get anything, it shrinks by another $k/N$.
 
-The switches can also do math. With **SHARP** (in-network reductions), the switch itself sums what the GPUs send and broadcasts the result, so an AllReduce costs $\text{bytes} / W_{\text{GPU}}$ instead of twice that. In theory. The book's own measurements show a gain of around 30%.
-
-Which brings up the catch: the spec numbers are optimistic. In the book's measurements, NVLink AllReduce bandwidth tops out near 370 GB/s, and only for huge messages (around 10GB per device). A realistic 58MB shard sees closer to 150 GB/s. So everything here is an upper bound.
+With **SHARP** (in-network reductions) the switch itself sums what the GPUs send, so an AllReduce costs $\text{bytes} / W_{\text{GPU}}$ instead of twice that. In theory. Measured, it's more like a 30% gain. Spec numbers are optimistic in general: NVLink AllReduce tops out near 370 GB/s for huge messages (around 10GB per device), and a realistic 58MB shard sees closer to 150 GB/s, so treat everything here as an upper bound.
 
 ### Cross-node Collectives
 
-Above the node a reduction climbs the tree one level at a time: the GPUs of a node first, then the nodes under a leaf, then the SUs under the spine. Since the fat tree gives every node 400 GB/s to anywhere, we can picture one big ring through all the nodes, and the cost is bytes over bandwidth again with the node's egress as the bandwidth:
+Above the node, the fat tree gives every node 400 GB/s to anywhere, so we can picture one big ring through all the nodes with the node's egress as the bandwidth:
 
 $$
 T_{\text{AG or RS}} = \max\left[\frac{\text{bytes}}{W_{\text{GPU}}}, \frac{\text{bytes}}{W_{\text{node}}}\right] \approx \frac{\text{bytes}}{400 \times 10^9}
 $$
 
-AllToAll does NOT survive the trip. It isn't hierarchical; every GPU really does have to reach every other GPU, so all 8 GPUs of a node squeeze through the same 400 GB/s. Over $M$ nodes:
+AllToAll does NOT survive the trip. Every GPU really has to reach every other GPU, so all 8 GPUs of a node squeeze through the same 400 GB/s. Over $M$ nodes:
 
 $$
 T_{\text{AllToAll}} \approx \frac{\text{bytes}}{M \cdot W_{\text{node}}}
@@ -129,21 +94,21 @@ Going from one node to two takes us from $\text{bytes} / (8 \times 450\text{e}9)
 
 ### A Second Sharded Axis
 
-On a TPU, if the array we're reducing over $X$ is also sharded over another axis $Y$, every chip moves $\frac{1}{Y}$ as much data and the collective gets $Y$ times cheaper. On GPUs that's only half true. Say $Y$ is the inner axis (it fills up a node first):
+On a TPU, if the array we're reducing over $X$ is also sharded over $Y$, the collective gets $Y$ times cheaper. On GPUs that's only half true. Say $Y$ is the inner axis (it fills a node first):
 
 $$
 T_{\text{node}} = \frac{\text{bytes}}{W_{\text{GPU}} \cdot \min(Y, 8)} \qquad T_{\text{scale-out}} = \frac{\text{bytes}}{W_{\text{node}}} \cdot \frac{8}{\max(Y, 8)}
 $$
 
-If $Y \le 8$, the node-level part gets cheaper, but the node still has to push the whole array through its one 400 GB/s uplink, so the total doesn't move. Only when $Y$ spans several nodes does the cross-node cost drop, in proportion to the number of nodes spanned. I think this is the one fact worth memorizing from the whole section, since it drives most of the sharding recipe below.
+If $Y \le 8$, the node-level part gets cheaper, but the node still pushes the whole array through its one 400 GB/s uplink, so the total doesn't move. Only when $Y$ spans several nodes does the cross-node cost drop, in proportion to the nodes spanned. I think this is the one fact worth memorizing from the section, since it drives most of the sharding recipe below.
 
 ## LLM Rooflines on GPUs
 
-Same setup as Chapter 5: one MLP block ($W_{\text{in}}[D, F]$ and $W_{\text{out}}[F, D]$), $B$ the batch in tokens, $C$ the FLOPs/s per GPU, and we compare $T_{\text{math}}$ with $T_{\text{comms}}$. The only new thing is that $W$ is 450e9 when the collective stays inside a node and 400e9 when it doesn't. For an H100 that makes $C/W$ either 2,200 or 2,475.
+Same setup as Chapter 5: one MLP block ($W_{\text{in}}[D, F]$ and $W_{\text{out}}[F, D]$), $B$ the batch in tokens, $C$ the FLOPs/s per GPU. The only new thing is that $W$ is 450e9 inside a node and 400e9 outside it, so for an H100 $C/W$ is either 2,200 or 2,475.
 
 ### 1. Data Parallelism
 
-Pure DP and FSDP (ZeRO) cost the same in the backward pass: a weight-sized AllReduce, or a ReduceScatter plus an AllGather. Per layer, with $X$ replicas:
+Pure DP and FSDP (ZeRO) cost the same: a weight-sized AllReduce (or ReduceScatter plus AllGather) in the backward pass. With $X$ replicas:
 
 $$
 T_{\text{math}} = \frac{8BDF}{X \cdot C} \qquad T_{\text{comms}} = \frac{8DF}{W} \implies \frac{B}{X} > \frac{C}{W}
@@ -151,11 +116,11 @@ $$
 
 So we need around **2,500 tokens per GPU** (2,475 across nodes), against 850 on a TPU v5p using all three torus axes. Three adjustments:
 
-- **MoE:** With $E$ experts and $k$ active per token, there are $E$ times the weights but only $k$ times the FLOPs, so the threshold is multiplied by $E/k$. For $E = 128$ and $k = 4$ that's 79,200 tokens per GPU.
+- **MoE:** $E$ experts with $k$ active means $E$ times the weights for only $k$ times the FLOPs, so multiply the threshold by $E/k$. For $E = 128$ and $k = 4$ that's 79,200 tokens per GPU.
 
 - **Only 2-way DP:** The ring factor $(X - 1)/X$ is $\frac{1}{2}$, so the threshold halves to about 1,238.
 
-- **Model parallelism across nodes:** From the last section, if each replica is spread over several nodes, each node only moves its own slice of the weights. Spanning 8 nodes cuts the threshold by 8.
+- **Model parallelism across nodes:** Each node only moves its own slice of the weights, so a replica spanning 8 nodes cuts the threshold by 8.
 
 ### 2. Tensor Parallelism
 
@@ -165,68 +130,57 @@ $$
 T_{\text{math}} = \frac{4BDF}{Y \cdot C} \qquad T_{\text{comms}} = \frac{4BD}{W} \implies Y < \frac{F \cdot W}{C}
 $$
 
-That's $F/2200$ inside a node and $F/2475$ beyond it. For $F = 28{,}672$ it comes to 13 and 11.6, so TP fits comfortably in one 8-GPU node. With the 2-node discount again, the book's rule for exactly 2 nodes is $F > 2475 \cdot (Y - 8)$, which allows 16-way on paper (up to 19 for this $F$), but not much further. Quiz 5 Question 2 looks at how tight that really is.
+That's $F/2200$ inside a node and $F/2475$ beyond it. For $F = 28{,}672$ it comes to 13 and 11.6, so TP fits comfortably in one 8-GPU node. Over exactly 2 nodes the discount gives $F > 2475 \cdot (Y - 8)$, which allows 16-way on paper (up to 19 for this $F$). Quiz 5 Question 2 checks how tight that is.
 
 ### 3. Expert Parallelism
 
-For MoEs we can shard the weights by expert, $W_{\text{in}}[E_Z, D, F]$, and AllToAll each token's activations to wherever its experts live. Across nodes:
+For MoEs we shard the weights by expert, $W_{\text{in}}[E_Z, D, F]$, and AllToAll each token to wherever its experts live. Across nodes:
 
 $$
 T_{\text{math}} = \frac{4BkDF}{Z \cdot C} \qquad T_{\text{comms}} = \frac{4BD(Z - 8)}{W \cdot Z} \cdot \min\left(\frac{8k}{Z}, 1\right)
 $$
 
-Two regimes fall out. When $Z$ is small (under $8k$, so think a node or two), we need $F > \frac{C}{W} \cdot \frac{Z - 8}{k}$, which is easy to meet. When $Z$ is large, we need $F > 8 \cdot \frac{C}{W}$, about 19,800 on H100s; if the model clears that bar, $Z$ can go all the way up to $E$.
+When $Z$ is small (under $8k$, so a node or two), we need $F > \frac{C}{W} \cdot \frac{Z - 8}{k}$, which is easy. When $Z$ is large, we need $F > 8 \cdot \frac{C}{W}$, about 19,800 on H100s, and past that $Z$ can go all the way up to $E$.
 
 ### 4. Pipeline Parallelism
 
-Splitting the layers across nodes only sends a small microbatch of activations from one stage to the next:
+Splitting the layers across nodes only sends a small microbatch of activations between stages:
 
 $$
 T_{\text{per-layer comms}} \approx 1.5 \cdot \frac{2BD}{W \cdot N_{\text{layers}}}
 $$
 
-Basically free. The price is paid elsewhere: awkward code, pipeline bubbles where a stage sits idle, and a bad fit with FSDP (ZeRO-3 would have to AllGather the weights for every microbatch, so pipelined setups use ZeRO-1).
+Basically free. The price is awkward code, pipeline bubbles, and a bad fit with FSDP (ZeRO-3 would AllGather the weights for every microbatch, so pipelined setups use ZeRO-1).
 
 ### Takeaway
 
-Inside a node, GPUs are great: 450 GB/s to any neighbor in one hop, and cheap AllToAlls. Leaving the node costs a $9\times$ drop in per-GPU bandwidth, and that shapes everything else.
-
-DP or FSDP needs about 2,500 tokens per GPU (times $E/k$ for an MoE). TP is good for about 8-way, so one node, maybe two. Anything that spreads a model replica over several nodes (pipelining, expert parallelism, 2-node TP) makes the data-parallel reduction cheaper. So the usual recipe is a mix: TP or EP inside a node or two, pipelining across many nodes, and plain DP or ZeRO-1 on the outside.
-
-And faster chips on the same network make all of it harder, since $C/W$ only goes up.
+Inside a node GPUs are great: 450 GB/s to any neighbor in one hop, and cheap AllToAlls. Leaving the node is a $9\times$ drop per GPU, and that shapes everything else. Anything that spreads a replica over several nodes makes the data-parallel reduction cheaper, which is why the usual recipe is TP or EP inside a node or two, pipelining across many nodes, and DP or ZeRO-1 on the outside. Faster chips on the same network only make this harder, since $C/W$ goes up.
 
 ## Worked Problems
 
-All of the hardware numbers used here are collected under Reference Numbers at the end. One heads-up: the book doesn't stick to one set of chip numbers. Its text and solutions mostly use 990e12 FLOPs/s and 3.35e12 bytes/s for the H100, where its spec table rounds to 9.9e14 and 3.4e12. For the B200, some solutions use 2250e12 FLOPs/s and others the table's 2.3e15, and the HBM bandwidth is 8.0e12 in the table and the solutions but 9 TB/s in the text. Each problem below follows the inputs of the book's own solution and says which ones they are.
+Hardware numbers are under Reference Numbers at the end. One heads-up: the solutions mix chip numbers. For the H100 they mostly use 990e12 FLOPs/s and 3.35e12 bytes/s (the table rounds to 9.9e14 and 3.4e12), and for the B200 either 2250e12 or the table's 2.3e15 FLOPs/s. Each problem below follows its solution.
 
 ### Quiz 1: GPU hardware
 
 **Question 1 [CUDA cores]:** How many fp32 CUDA cores (ALUs) does an H100 have? A B200? How does that compare with the number of independent ALUs in a TPU v5p?
 
-- This is just counting down the chip layout: SMs, then subpartitions per SM, then fp32 cores per subpartition.
-- An H100 has 132 SMs, 4 subpartitions each, and 32 fp32 cores per subpartition:
+- Just counting down the chip: SMs, times 4 subpartitions, times 32 fp32 cores. The H100 has 132 SMs and the B200 has 148:
 
   $$
-  132 \times 4 \times 32 = \mathbf{16{,}896 \text{ CUDA cores}}
+  \text{H100: } 132 \times 4 \times 32 = \mathbf{16{,}896 \text{ CUDA cores}} \qquad \text{B200: } 148 \times 4 \times 32 = \mathbf{18{,}944 \text{ CUDA cores}}
   $$
 
-- A B200 has 148 SMs with the same layout:
-
-  $$
-  148 \times 4 \times 32 = \mathbf{18{,}944 \text{ CUDA cores}}
-  $$
-
-- A TPU v5p has 2 TensorCores. Each one has a VPU made of 4 independently programmable units, and each unit is $8 \times 128$ lanes:
+- A TPU v5p has 2 TensorCores, each with a VPU of 4 independently programmable units of $8 \times 128$ lanes:
 
   $$
   2 \times 4 \times 8 \times 128 = \mathbf{8{,}192 \text{ ALUs}}
   $$
 
-- So an H100 has about twice the vector lanes of a v5p ($2.06\times$, and $2.31\times$ for the B200), running at roughly the same clock speed. The bigger difference is how they're grouped: the H100's are 528 independent little units of 32, and the v5p's are 8 big units of 1,024.
+- So an H100 has about twice the vector lanes of a v5p ($2.06\times$, and $2.31\times$ for the B200) at roughly the same clock, but split into 528 independent units of 32 instead of 8 big units of 1,024.
 
 **Question 2 [vector FLOPs calculation]:** An H100 has 132 SMs and a 1.59GHz clock (1.98GHz with boost). If every ALU does one vector op per cycle, how many vector fp32 FLOPs/s does the chip get, with and without boost? How does that compare with its matmul FLOPs/s?
 
-- One op per core per cycle, so we just multiply the core count from Question 1 by the clock:
+- One op per core per cycle, so we just multiply the cores from Question 1 by the clock:
 
   $$
   16{,}896 \times 1.59 \times 10^9 = 2.69 \times 10^{13} = \mathbf{26.9 \text{ TFLOPs/s}}
@@ -236,95 +190,79 @@ All of the hardware numbers used here are collected under Reference Numbers at t
   16{,}896 \times 1.98 \times 10^9 = 3.35 \times 10^{13} = \mathbf{33.5 \text{ TFLOPs/s (boost)}}
   $$
 
-- The spec sheet says about double this ($2 \times 33.5 = 67 \text{ TFLOPs/s}$; the book's text has 66), because a fused multiply-add counts as 2 FLOPs in one cycle. That's fair for a dot product but not for most vector work.
-- The Tensor Cores do 990 TFLOPs/s in bf16. That's around $30\times$ the boosted vector number ($37\times$ at the base clock).
-- Meaning, anything that isn't a matmul runs on a roughly $30\times$ slower machine.
+- The spec sheet says about double ($2 \times 33.5 = 67 \text{ TFLOPs/s}$) because it counts a fused multiply-add as 2 FLOPs per cycle. Fair for a dot product, not for most vector work.
+- The Tensor Cores do 990 TFLOPs/s in bf16, around $30\times$ the boosted number ($37\times$ at base clock). Meaning, anything that isn't a matmul runs on a roughly $30\times$ slower machine.
 
 **Question 3 [GPU matmul intensity]:** What is the peak fp16 matmul intensity on an H100? On a B200? What about fp8? Intensity here means the ratio of matmul FLOPs/s to memory bandwidth.
 
-- This is the hardware critical intensity from Chapter 1, with the GPU's numbers plugged in. The solution uses 990e12 FLOPs/s over 3.35e12 bytes/s for the H100 and 2250e12 over 8e12 for the B200, so we do too.
+- The hardware critical intensity from Chapter 1, just plugging in the solution's numbers:
 
   $$
   \text{H100: } \frac{990 \times 10^{12} \text{ FLOPs/s}}{3.35 \times 10^{12} \text{ bytes/s}} = \mathbf{295 \text{ FLOPs/byte}} \qquad \text{B200: } \frac{2250 \times 10^{12}}{8 \times 10^{12}} = \mathbf{281 \text{ FLOPs/byte}}
   $$
 
-- Both chips do exactly $2\times$ the FLOPs/s in fp8, so the fp8 intensities are **591** and **562** (the solution doubles the rounded 295 and says 590).
-- With the rounded table values (9.9e14/3.4e12 and 2.3e15/8.0e12) we'd get 291 and 288. Same answer for napkin math. The one input that would really move it is the 9 TB/s the book's text quotes for the B200's HBM, which gives 250 instead of 281.
-- These sit right next to the 240 of a TPU v5e. So the rule from Chapter 1 holds on GPUs too: a bf16 matmul needs a batch of around 280 to 300 tokens to be compute-bound.
-- The fp8 number looks twice as demanding, but if the weights are also stored in fp8 then every parameter is 1 byte instead of 2, and the matmul's own intensity doubles as well. The batch size we need stays about the same.
+- Both chips do exactly $2\times$ the FLOPs/s in fp8, so the fp8 intensities are **591** and **562**. (The solution doubles the rounded 295 and says 590.)
+- Right next to the TPU v5e's 240, so a bf16 matmul needs a batch of around 280 to 300 tokens to be compute-bound here too.
+- fp8 looks twice as demanding, but fp8 weights are 1 byte each instead of 2, which doubles the matmul's own intensity too. The batch we need stays about the same.
 
 **Question 4 [matmul runtime]:** Using the answer to Question 3, how long should an `fp16[64, 4096] * fp16[4096, 8192]` matmul take on a single B200? How about `fp16[512, 4096] * fp16[4096, 8192]`?
 
-- From Question 3 the B200 flips from memory-bound to compute-bound at a batch of around 281. So $B = 64$ should be limited by HBM bandwidth and $B = 512$ by FLOPs. We'll work out both times for each anyway, with $D = 4096$ and $F = 8192$.
-- Inputs, as in the solution: 8e12 bytes/s of HBM bandwidth, and the table's 2.3e15 FLOPs/s for $C$. (The 281 came from 2250e12; the solution switches between the two.)
-- **$B = 64$:** we read $x$ and $W$ and write the output, at 2 bytes per element:
+- From Question 3, $B = 64$ should be HBM-bound and $B = 512$ FLOPs-bound (the crossover is around 281). We'll check both, with 8e12 bytes/s and the table's 2.3e15 FLOPs/s as in the solution.
+- **$B = 64$:** read $x$ and $W$, write the output, 2 bytes per element:
 
   $$
   2BD + 2DF + 2BF = 524{,}288 + 67{,}108{,}864 + 1{,}048{,}576 = 68{,}681{,}728 \text{ bytes}
   $$
 
   $$
-  T_{\text{comms}} = \frac{68{,}681{,}728 \text{ bytes}}{8 \times 10^{12} \text{ bytes/s}} = \mathbf{8.6 \ \mu\text{s}}
+  T_{\text{comms}} = \frac{68{,}681{,}728 \text{ bytes}}{8 \times 10^{12} \text{ bytes/s}} = \mathbf{8.6 \ \mu\text{s}} \qquad T_{\text{math}} = \frac{4{,}294{,}967{,}296 \text{ FLOPs}}{2.3 \times 10^{15} \text{ FLOPs/s}} = 1.9 \ \mu\text{s}
   $$
 
-  $$
-  T_{\text{math}} = \frac{2BDF}{C} = \frac{4{,}294{,}967{,}296 \text{ FLOPs}}{2.3 \times 10^{15} \text{ FLOPs/s}} = 1.9 \ \mu\text{s}
-  $$
-
-  Memory wins by a wide margin, so about **8.6 μs**.
+  Memory wins, so about **8.6 μs**.
 
 - **$B = 512$:** same steps.
 
   $$
-  T_{\text{comms}} = \frac{79{,}691{,}776 \text{ bytes}}{8 \times 10^{12} \text{ bytes/s}} = 10.0 \ \mu\text{s}
+  T_{\text{comms}} = \frac{79{,}691{,}776 \text{ bytes}}{8 \times 10^{12} \text{ bytes/s}} = 10.0 \ \mu\text{s} \qquad T_{\text{math}} = \frac{34{,}359{,}738{,}368 \text{ FLOPs}}{2.3 \times 10^{15} \text{ FLOPs/s}} = \mathbf{14.9 \ \mu\text{s}}
   $$
 
-  $$
-  T_{\text{math}} = \frac{34{,}359{,}738{,}368 \text{ FLOPs}}{2.3 \times 10^{15} \text{ FLOPs/s}} = \mathbf{14.9 \ \mu\text{s}}
-  $$
+  Now the math is the slow part, so about **15 μs**.
 
-  Now the math is the slow part, so about **15 μs**. (With the 2250e12 from Question 3 it would be 15.3 μs. Same answer.)
-
-- Notice the weights are 67MB of the roughly 69MB moved in the first case. At small batch we're basically paying to stream $W$ out of HBM and nothing else.
-- Solving for the exact crossover with these shapes gives $B \approx 321$ (314 with 2250e12), a bit above the 281 to 288 that the plain intensity ratio gives, because with $D = 4096$ the activation and output bytes aren't quite negligible.
-- These are rooflines. The solution expects something more like 10 to 12 μs and 20 μs in practice, since we never get all of the bandwidth or all of the FLOPs.
+- Notice the weights are 67MB of the roughly 69MB moved at $B = 64$. At small batch we're basically just streaming $W$ out of HBM.
+- In practice the solution expects more like 10 to 12 μs and 20 μs, since we never get all the bandwidth or all the FLOPs.
 
 **Question 5 [L1 cache capacity]:** What is the total L1/SMEM capacity of an H100? What about register memory? How does this compare with TPU VMEM capacity?
 
-- Both are per-SM numbers, so we multiply by 132 SMs.
-- SMEM is 256kB per SM:
+- Both are per-SM numbers, so we multiply by 132 SMs. SMEM is 256kB per SM:
 
   $$
   132 \times 256 \text{ kB} = 33{,}792 \text{ kB} = \mathbf{33 \text{ MB}}
   $$
 
-- Registers: each of the 4 subpartitions has 16,384 registers of 4 bytes, so $4 \times 16{,}384 \times 4 = 262{,}144 \text{ bytes}$, which is also 256kB per SM and another **33 MB** per chip.
-- These are power-of-two units: 256kB is 262,144 bytes, and we divide by 1,024 to get MB. So strictly it's 33 MiB of each, or 34.6 million bytes. The solution also says 33MB; the book's GPU vs. TPU table rounds both down to 32MB.
-- Together that's about **66 MB** of fast memory, roughly half of a TPU v5p's 128MB of VMEM (52% of it; the solution quotes 120MB for VMEM, which makes it 55%).
-- The split is very different though. A TPU has only 256kB of register memory in total, and the H100 has 33MB of it. The solution's explanation is that VMEM is so low-latency that spilling registers into it is cheap, so the TPU doesn't need many.
+- Registers: $4 \times 16{,}384 \times 4 = 262{,}144 \text{ bytes}$ (4 subpartitions of 16,384 four-byte registers), also 256kB per SM, so another **33 MB** per chip.
+- Together that's about **66 MB** of fast memory, roughly half of a TPU v5p's 128MB of VMEM.
+- The split is very different though. A TPU has only 256kB of register memory in total, and the H100 has 33MB. The solution's explanation is that VMEM is low-latency enough that spilling registers into it is cheap.
 
 **Question 6 [calculating B200 clock frequency]:** NVIDIA reports that a B200 can do 80 TFLOPs/s of vector fp32 compute. Given that each CUDA core can do 2 FLOPs per cycle with an FMA (fused multiply-add), estimate the peak clock frequency.
 
-- This is Question 2 run backwards: we know the FLOPs/s and the core count, and want the cycles per second.
-- From Question 1 a B200 has 18,944 CUDA cores, so with FMAs it does $18{,}944 \times 2 = 37{,}888$ FLOPs per cycle.
+- Question 2 run backwards. We're told the FLOPs/s and we know the core count, so we just solve for cycles per second.
+- 18,944 CUDA cores from Question 1 at 2 FLOPs each is $18{,}944 \times 2 = 37{,}888$ FLOPs per cycle:
 
   $$
   \frac{80 \times 10^{12} \text{ FLOPs/s}}{37{,}888 \text{ FLOPs/cycle}} = \mathbf{2.11 \text{ GHz}}
   $$
 
-- That's a bit above the H100's 1.98GHz boost clock. The solution calls it high but reasonable, since B200s are generally liquid cooled.
+- A bit above the H100's 1.98GHz boost. The solution calls it high but reasonable, since B200s are generally liquid cooled.
 
 **Question 7 [estimating H100 add runtime]:** Using the figures above, how long should it take to add two `fp32[N]` vectors on a single H100? Work out both $T_{\text{math}}$ and $T_{\text{comms}}$. What is the arithmetic intensity of the operation? If you can get access, run it in PyTorch or JAX for $N = 1024$ and $N = 1024 \times 1024 \times 1024$ and compare.
 
-- An add is a vector op, so it runs on the CUDA cores, not the Tensor Cores. That changes which FLOPs/s number we use.
-- FLOPs: one add per element, so $N$.
-- Bytes: we load two vectors and store one, at 4 bytes per element, so $3 \times 4N = 12N$.
+- An add is a vector op, so it runs on the CUDA cores, not the Tensor Cores. FLOPs: one per element, so $N$. Bytes: two loads and one store at 4 bytes each, so $3 \times 4N = 12N$.
 
   $$
   \text{Intensity} = \frac{N \text{ FLOPs}}{12N \text{ bytes}} = \mathbf{\frac{1}{12} \text{ FLOPs/byte}}
   $$
 
-- The hardware side: 33.5 TFLOPs/s of vector compute (Question 2, with boost and no FMA) over 3.35e12 bytes/s of HBM bandwidth is about 10 FLOPs/byte. We're at $\frac{1}{12}$. So the add is memory-bound by a factor of around 120, and there's nothing a batch size can do about it.
+- The hardware side is 33.5 TFLOPs/s (Question 2, boost, no FMA) over 3.35e12 bytes/s, about 10 FLOPs/byte. We're at $\frac{1}{12}$, memory-bound by a factor of around 120, and no batch size fixes that.
 
   $$
   T_{\text{math}} = \frac{N}{3.35 \times 10^{13}} \text{ s} \qquad T_{\text{comms}} = \frac{12N}{3.35 \times 10^{12}} = \frac{N}{2.79 \times 10^{11}} \text{ s}
@@ -334,14 +272,14 @@ All of the hardware numbers used here are collected under Reference Numbers at t
   T = \max(T_{\text{math}}, T_{\text{comms}}) = \mathbf{\frac{N}{2.79 \times 10^{11}} \text{ s}}
   $$
 
-- **$N = 1024$:** $T_{\text{comms}}$ is 3.7 nanoseconds. (The math is even less: 1,024 elements only keep 1,024 cores busy, which is 8 of the 132 SMs, for a single cycle.) Nothing on a GPU actually finishes in a few nanoseconds, so here we'd be latency-bound: the time is whatever it costs to launch the kernel.
-- **$N = 1024^3$:** we move $12 \times 2^{30} = 12{,}884{,}901{,}888$ bytes (12 GiB in total, which fits in 80GB), so
+- **$N = 1024$:** $T_{\text{comms}}$ is 3.7 nanoseconds. Nothing on a GPU really finishes that fast, so this one is latency-bound: the time is whatever the kernel launch costs.
+- **$N = 1024^3$:** we move $12 \times 2^{30} = 12{,}884{,}901{,}888$ bytes (12 GiB, fits in 80GB):
 
   $$
   T = \frac{12{,}884{,}901{,}888 \text{ bytes}}{3.35 \times 10^{12} \text{ bytes/s}} = \mathbf{3.85 \text{ ms}}
   $$
 
-- The solution reports its own JAX runs: about 1.5 μs for $N = 65{,}536$ (where this roofline says 0.23 μs, so latency-bound as expected) and 4.1 ms for $N = 1024^3$, close to the 3.85 ms roofline (which it rounds to 3.84). Those timings are the book's, not ours.
+- The solution quotes its own JAX timings: about 1.5 μs for $N = 65{,}536$ (roofline 0.23 μs, so latency-bound as expected) and 4.1 ms for $N = 1024^3$, close to the 3.85 ms roofline.
 - To check it ourselves:
 
   ```python
@@ -367,113 +305,71 @@ All of the hardware numbers used here are collected under Reference Numbers at t
 
 **Question 1 [total bandwidth for H100 node]:** An 8xH100 node has 4 NVSwitches. What is the total bandwidth of the node? Hint: check the NVLink links and the NVSwitch ports separately.
 
-- There are two places the bandwidth could run out: the links coming out of the GPUs, and the ports on the switches. We work out both and take the smaller one.
-- **Switches:** each NVSwitch has 64 ports at 25 GB/s.
-
-  $$
-  4 \text{ switches} \times 64 \text{ ports} \times 25 \text{ GB/s} = 6.4 \text{ TB/s}
-  $$
-
-- **Links:** each GPU has 18 NVLinks ($5 + 4 + 4 + 5$ to the four switches), so 450 GB/s per GPU.
+- Bandwidth can run out at the links leaving the GPUs or at the switch ports, so we work out both and take the smaller.
+- **Switches:** $4 \text{ switches} \times 64 \text{ ports} \times 25 \text{ GB/s} = 6.4 \text{ TB/s}$.
+- **Links:** each GPU has 18 NVLinks ($5 + 4 + 4 + 5$ to the four switches):
 
   $$
   8 \text{ GPUs} \times 18 \text{ links} \times 25 \text{ GB/s} = \mathbf{3.6 \text{ TB/s}}
   $$
 
-- The links are the limit, so the node has **3.6 TB/s** in total. The switches have plenty of room: only 144 of their 256 ports are plugged in.
-- This is a full-duplex number. The GPUs can send 3.6 TB/s into the switches and receive 3.6 TB/s back at the same time.
+- The links are the limit, so the node has **3.6 TB/s** in total. The switches have room to spare (only 144 of their 256 ports are used), and since it's full-duplex, 3.6 TB/s can come back at the same time.
 
 **Question 2 [bisection bandwidth]:** Cut a network into two equal halves and add up the bandwidth that crosses the cut. The bisection bandwidth is the smallest value we can get over every way of making that cut. What is it for an 8xH100 node? Hint: the figure usually counts flow in both directions.
 
-- Any even split puts 4 GPUs on each side. Since every GPU reaches every other one through the switches, all splits look the same.
-- Each GPU can push its full 450 GB/s at the other half, so one way we have $4 \times 450 \text{ GB/s} = 1.8 \text{ TB/s}$. Adding the other direction:
+- Any even split puts 4 GPUs on each side, and since every GPU reaches every other one through the switches, all splits look the same.
+- Each GPU can push its full 450 GB/s across, so one way it's $4 \times 450 \text{ GB/s} = 1.8 \text{ TB/s}$. Adding the other direction:
 
   $$
   2 \times 4 \times 450 \text{ GB/s} = \mathbf{3.6 \text{ TB/s}}
   $$
 
-- The both-directions 3.6 TB/s is the figure the solution gives.
-- As a check, computing the max-flow over the actual $5 + 4 + 4 + 5$ wiring (a graph calculation, not a measurement) gives 1,800 GB/s one way, whichever 4 GPUs go on each side.
-- Same number as Question 1, and that's not a coincidence. It means the switches never get in the way: whatever the 4 GPUs on one side can send, the fabric can carry across. Dividing by the 8 GPUs gives back the 450 GB/s per GPU that we use as the collective bandwidth.
+- Same number as Question 1, and not by coincidence: whatever the 4 GPUs on one side can send, the switches carry across.
 
 **Question 3 [AllGather cost]:** How long does an AllGather of an array of $B$ bytes take on an 8xH100 node, assuming it's throughput-bound? Then put numbers in for $\text{bf16}[D_X, F]$ with $D = 4096$ and $F = 65{,}536$.
 
-- This is the ring AllGather from Chapter 3, with the NVLink egress standing in for the ICI link.
-- With $N = 8$ GPUs, each one starts with $\frac{B}{N}$ bytes. On every turn each GPU passes one shard along at 450 GB/s, and after $N - 1$ turns everybody has everything:
+- The ring AllGather from Chapter 3, with NVLink egress standing in for ICI. Each of the $N = 8$ GPUs starts with $\frac{B}{N}$, passes one shard per turn at 450 GB/s, and after $N - 1$ turns everyone has everything:
 
   $$
   T_{\text{comms}} = (N - 1) \cdot \frac{B}{N \cdot W_{\text{GPU}}} = \frac{7B}{8 \times 450 \times 10^9} \approx \frac{B}{450 \times 10^9}
   $$
 
-- For our array:
-
-  $$
-  B = 4096 \times 65{,}536 \times 2 \text{ bytes} = 536{,}870{,}912 \text{ bytes}
-  $$
+- For our array, $B = 4096 \times 65{,}536 \times 2 = 536{,}870{,}912$ bytes:
 
   $$
   T_{\text{comms}} = \frac{536{,}870{,}912 \times 7}{8 \times 450 \times 10^9} = \mathbf{1.04 \text{ ms}}
   $$
 
-- With the lazy $B/W$ version it's 1.19 ms. The $\frac{7}{8}$ matters a little at $N = 8$ and stops mattering in bigger rings.
-- The solution adds that this takes about 1.5 ms in practice, which fits the note above about NVLink not delivering its full 450 GB/s.
+- The lazy $B/W$ version gives 1.19 ms; the $\frac{7}{8}$ stops mattering in bigger rings. The solution says about 1.5 ms in practice, which fits NVLink not delivering its full 450 GB/s.
 
 ### Quiz 3: Beyond the node level
 
 **Question 1 [fat tree topology]:** Take the reference 1,024-GPU H100 SuperPod: 128 nodes of 8 GPUs, one 400 Gbps NIC per GPU, 4 SUs of 32 nodes with 8 leaf switches each, 16 spine switches, 64-port switches everywhere, and 2 links from every leaf to every spine. Calculate the bisection bandwidth of the whole pod at the node level, and show that every link is sized so the pod keeps full bisection bandwidth. Hint: work out the link bandwidth and the switch bandwidth at each level.
 
-- First the units: 400 Gbps is $400 / 8 = 50 \text{ GB/s}$ per cable and per switch port.
-- "Full bisection bandwidth" means every node can use its whole 400 GB/s no matter how we cut the pod in half. So we go up the tree level by level and check that the cables and the switches can both carry 400 GB/s per node.
-- **Node to leaf (cables):** each node has 8 NICs, one cable to each of the 8 leaf switches in its SU.
-
-  $$
-  8 \times 50 \text{ GB/s} = 400 \text{ GB/s per node} \qquad 32 \text{ nodes} \times 400 \text{ GB/s} = 12.8 \text{ TB/s per SU}
-  $$
-
-- **Leaf switches:** a leaf gets one cable from each of the 32 nodes in its SU, so 32 of its 64 ports face down. That's $32 \times 50 = 1.6 \text{ TB/s}$ per leaf, and with 8 leaves, 12.8 TB/s per SU. Exactly 400 GB/s per node.
-- **Leaf to spine (cables):** the other 32 ports face up, 2 cables to each of the 16 spines.
-
-  $$
-  8 \text{ leaves} \times 16 \text{ spines} \times 2 \times 50 \text{ GB/s} = 12.8 \text{ TB/s per SU}
-  $$
-
-  Still 400 GB/s per node.
-
-- **Spine switches:** each spine has 2 cables from each of the 32 leaves, so all 64 ports are used and all face down: 3.2 TB/s per spine.
-
-  $$
-  16 \times 3.2 \text{ TB/s} = 51.2 \text{ TB/s} = 128 \text{ nodes} \times 400 \text{ GB/s}
-  $$
-
-- So every level matches. There are 1,024 cables from nodes to leaves and 1,024 from leaves to spines, 51.2 TB/s at each level, and no switch has a spare port or an oversubscribed one.
-- Now the bisection. Split the 128 nodes into two halves of 64. Each node can send its full 400 GB/s across the cut:
+- 400 Gbps is 50 GB/s per cable and per port. Full bisection bandwidth means every node can use its whole 400 GB/s however we cut the pod, so we check each level carries 400 GB/s per node.
+- **Node to leaf:** 8 NICs per node, one cable to each of the SU's 8 leaves: $8 \times 50 = 400$ GB/s per node, 12.8 TB/s per SU. That's 32 of each leaf's 64 ports ($32 \times 50 = 1.6 \text{ TB/s}$).
+- **Leaf to spine:** the other 32 ports go up, 2 cables to each of 16 spines: $8 \times 16 \times 2 \times 50 \text{ GB/s} = 12.8 \text{ TB/s}$ per SU.
+- **Spine:** 2 cables from each of 32 leaves fills all 64 ports, so 3.2 TB/s per spine, and $16 \times 3.2 = 51.2$ TB/s is exactly $128 \times 400$ GB/s. Every level matches.
+- For the bisection, split the nodes into two halves of 64, each sending its full 400 GB/s across:
 
   $$
   64 \times 400 \text{ GB/s} = 25.6 \text{ TB/s one way} \implies \mathbf{51.2 \text{ TB/s}} \text{ counting both directions}
   $$
 
-- The solution stops at 400 GB/s per node across any cut and doesn't quote a pod total. 51.2 TB/s is the spine-level figure in the book's tables, which matches the both-directions number.
-- Computing the max-flow over the whole topology (again a graph calculation, not a measurement) gives the same 25,600 GB/s one way, whether the cut follows the SUs or splits them. With only 1 cable per leaf-spine pair, an SU-aligned cut would drop to 12,800 GB/s. So the doubled uplinks are exactly what makes the tree "fat".
-- Per GPU that's 50 GB/s in each direction, which is where the $9\times$ drop from NVLink in the notes comes from.
+- With only 1 cable per leaf-spine pair, a cut along the SUs would get just 12,800 GB/s one way, half of that, so the doubled uplinks are what make the tree "fat". Per GPU it's 50 GB/s each way, the $9\times$ drop from NVLink.
 
 **Question 2 [scaling to a larger DGX pod]:** Say we want to train on 2,048 GPUs instead of 1,024. What's the simplest way to modify the DGX topology above? What about 4,096? Hint: there's no single right answer, but try to keep costs down, and keep link capacity in mind.
 
-- The real constraint here is ports. Every InfiniBand switch has 64 of them. A leaf uses 32 for its nodes and has 32 left to go up. A spine has all 64 facing down.
-- **2,048 GPUs:** keep the SU as it is (32 nodes under 8 leaves) and double everything above it. 8 SUs means 64 leaves and $64 \times 32 = 2{,}048$ uplinks, which needs $2{,}048 / 64 = 32$ spines.
-- Each leaf only has 32 uplinks, so it can't run 2 cables to each of 32 spines. But it doesn't need to: 1 cable to each of 32 spines is the same 1.6 TB/s as 2 cables to each of 16. Total spine bandwidth is $32 \times 3.2 = 102.4 \text{ TB/s}$, which is 256 nodes at 400 GB/s. Still a full fat tree, with 96 InfiniBand switches instead of 48.
-- **4,096 GPUs:** now the ports run out. 16 SUs is 128 leaves, but a spine can only reach 64 leaves (one port each) and a leaf can only reach 32 spines. Two levels of switches top out at exactly 2,048 GPUs.
-- So we need a third level. NVIDIA calls it the core, and per the solution the reference design uses 128 spine and 64 core switches. Checking the ports: 128 leaves have 4,096 uplinks, 128 spines split 32 down and 32 up take those and pass 4,096 links on, and $64 \times 64 = 4{,}096$ core ports receive them. 204.8 TB/s at every level, which is 512 nodes at 400 GB/s.
-- The cost shows up in the switch count: 320 InfiniBand switches for 4,096 GPUs, or one per 12.8 GPUs, against one per 21.3 GPUs in the two smaller builds. Plus an extra hop of latency. The cheaper alternative would be to oversubscribe the top level and give up full bisection bandwidth.
+- The real constraint is ports: a leaf has 32 facing down and 32 up, and a spine has all 64 facing down.
+- **2,048 GPUs:** keep the SU and double everything above it. 8 SUs is 64 leaves with $64 \times 32 = 2{,}048$ uplinks, so $2{,}048 / 64 = 32$ spines, each leaf running 1 cable to each (the same 1.6 TB/s as 2 cables to each of 16). That's $32 \times 3.2 = 102.4 \text{ TB/s}$, or 256 nodes at 400 GB/s. Still a full fat tree, with 96 switches instead of 48.
+- **4,096 GPUs:** the ports run out. 16 SUs is 128 leaves, but a spine can only reach 64 leaves and a leaf only 32 spines, so two levels top out at exactly 2,048 GPUs. We need a third level, the core: per the solution, 128 spine and 64 core switches. Checking ports: 128 leaves have 4,096 uplinks, 128 spines (32 down, 32 up) pass 4,096 links on, and $64 \times 64 = 4{,}096$ core ports receive them. 204.8 TB/s at every level, 512 nodes at 400 GB/s.
+- The cost: 320 switches for 4,096 GPUs, one per 12.8 GPUs against one per 21.3 in the smaller builds, plus an extra hop of latency. The cheaper option is to oversubscribe the top level and give up full bisection bandwidth.
 
 ### Pop Quizzes: collectives
 
 **Pop Quiz 1 [AllGather time]:** On an 8xH100 node, with 450 GB/s of full-duplex bandwidth, how long does $\text{AllGather}(\text{bf16}[B_X, F])$ take for $B = 1024$ and $F = 16{,}384$?
 
-- Same ring as Quiz 2 Question 3, just a smaller array:
-
-  $$
-  2 \times 1024 \times 16{,}384 = 33{,}554{,}432 \text{ bytes}
-  $$
+- Same ring as Quiz 2 Question 3, smaller array, $2 \times 1024 \times 16{,}384 = 33{,}554{,}432$ bytes:
 
   $$
   T_{\text{comms}} \approx \frac{33{,}554{,}432 \text{ bytes}}{450 \times 10^9 \text{ bytes/s}} = 75 \ \mu\text{s} \qquad \text{or exactly} \qquad \frac{33{,}554{,}432 \times 7}{8 \times 450 \times 10^9} = \mathbf{65 \ \mu\text{s}}
@@ -483,43 +379,41 @@ All of the hardware numbers used here are collected under Reference Numbers at t
 
 **Pop Quiz 2 [AllToAll time]:** Same 8xH100 node, 450 GB/s of unidirectional bandwidth. How long does $\text{AllToAll}_{X \to N}(\text{bf16}[B_X, N])$ take? And if only 4 of the 8 entries are known to be non-zero?
 
-- Careful with the letters. Here $B$ is the batch dimension, not a byte count, and $N = 8$ is both the second dimension of the array and the number of GPUs. So the array is $V = 2BN = 16B$ bytes.
-- Each GPU starts with $\frac{V}{N}$ bytes (its rows). After the AllToAll it should hold one column instead, so it keeps $\frac{1}{N}$ of what it has and sends $\frac{V}{N^2}$ straight to each of the other $N - 1$ GPUs. Its total egress sets the time:
+- Careful with the letters: $B$ is the batch dimension here, and $N = 8$ is both the second dimension and the number of GPUs. So the array is $V = 2BN = 16B$ bytes.
+- Each GPU starts with $\frac{V}{N}$ bytes (its rows), keeps $\frac{1}{N}$ of them, and sends $\frac{V}{N^2}$ straight to each of the other $N - 1$ GPUs:
 
   $$
   T_{\text{comms}} = \frac{V \cdot (N - 1)}{N^2 \cdot W_{\text{GPU}}} = \frac{7V}{64 \times 450 \times 10^9} \approx \frac{V}{8 \times 450 \times 10^9} = \mathbf{\frac{V}{3.6 \times 10^{12}} \text{ s}}
   $$
 
-- In terms of the batch that's about $4.4 \times 10^{-12} \cdot B$ seconds ($3.9 \times 10^{-12} \cdot B$ with the exact $\frac{7}{64}$).
-- **If only 4 of the 8 entries are non-zero:** each GPU only has to ship the non-zero half of every chunk, so the cost is multiplied by $k/N = \frac{1}{2}$:
+- In terms of the batch, about $4.4 \times 10^{-12} \cdot B$ seconds ($3.9 \times 10^{-12} \cdot B$ with the exact $\frac{7}{64}$).
+- **If only 4 of the 8 entries are non-zero:** each GPU only ships the non-zero half of every chunk, so multiply by $k/N = \frac{1}{2}$:
 
   $$
   T_{\text{comms}} \approx \frac{V}{2 \cdot N \cdot W_{\text{GPU}}} = \mathbf{\frac{V}{7.2 \times 10^{12}} \text{ s}}
   $$
 
-- What this means: inside a node an AllToAll behaves like it has 3.6 TB/s to work with, $8\times$ the AllGather bandwidth, because nobody has to forward anyone else's data. This is why expert routing in an MoE is cheap as long as it stays in one node.
+- Meaning, inside a node an AllToAll acts like it has 3.6 TB/s, $8\times$ the AllGather bandwidth, because nobody forwards anyone else's data. That's why MoE expert routing is cheap as long as it stays in one node.
 
 **Pop Quiz 3 [sharding along 2 axes]:** Say we want to do $\text{AllGather}_X(\text{bf16}[D_X, F_Y])$ over a single SU (256 chips), where $Y$ is the inner axis. How long will this take as a function of $D$, $F$ and $Y$?
 
-- The array is $2DF$ bytes. $Y$ being the inner axis means the $Y$ GPUs that share one shard of $D$ sit next to each other: they fill up a node first and then spill into the next nodes. There are $X = 256/Y$ of these groups.
-- Every GPU needs the $D$ shards of the other $X - 1$ groups, but only for its own slice of $F$. That's $\frac{2DF}{Y} \cdot \frac{X - 1}{X}$ bytes per GPU. The question is what link those bytes arrive through.
-- **Case 1, $Y \le 8$:** every node holds all $Y$ slices of $F$. Between its 8 GPUs, a node therefore needs every byte of the array it doesn't already have, which is $\frac{31}{32}$ of it, and all of that comes down the node's one 400 GB/s uplink:
+- The array is $2DF$ bytes. With $Y$ inner, the $Y$ GPUs sharing a shard of $D$ fill a node first, and there are $X = 256/Y$ groups. Each GPU needs the other groups' $D$ shards for its own slice of $F$; the question is which link they come through.
+- **Case 1, $Y \le 8$:** every node holds all $Y$ slices of $F$, so it needs every byte it doesn't already have, $\frac{31}{32}$ of the array, all through one 400 GB/s uplink:
 
   $$
   T_{\text{comms}} = \frac{2DF \cdot 31}{32 \times 400 \times 10^9} \approx \mathbf{\frac{2DF}{400 \times 10^9} \text{ s}}
   $$
 
-  No $Y$ in it at all. Sharding $F$ inside the node shrinks each GPU's share, but the node as a whole downloads the same bytes. (The NVLink part of the gather is always faster than this, so it never sets the time.)
+  No $Y$ in it at all. Sharding $F$ inside the node shrinks each GPU's share, but the node downloads the same bytes.
 
-- **Case 2, $Y > 8$:** now each group spans $Y/8$ nodes, and a node holds 8 different slices of $F$, one per GPU. Each GPU pulls its own bytes through its own 50 GB/s share of the uplink:
+- **Case 2, $Y > 8$:** each group spans $Y/8$ nodes, and a node holds 8 different slices of $F$, one per GPU. Each GPU pulls its own bytes through its own 50 GB/s share of the uplink:
 
   $$
   T_{\text{comms}} = \frac{2DF}{Y \times 50 \times 10^9} \cdot \frac{X - 1}{X} \approx \mathbf{\frac{2DF}{Y \times 50 \times 10^9} \text{ s}}
   $$
 
-- At $Y = 8$ the two cases agree, since $8 \times 50 = 400$.
-- The solution has the same two cases. For $Y \le 8$ it keeps the $\frac{31}{32}$, and for $Y > 8$ it gives only the approximate form, written as $2DF \cdot 256 / (Y \times 12.8\text{e}12)$. The $\frac{X - 1}{X}$ in the second case is our own addition: it's the usual ring factor with $X$ groups in the ring, and it only matters once $X$ gets small.
-- The book plots this for $D = 8192$, $F = 32{,}768$ (so $2DF = 536{,}870{,}912$ bytes). Putting those values into the two formulas above:
+- At $Y = 8$ the cases agree ($8 \times 50 = 400$), and the $\frac{X - 1}{X}$ only matters once $X$ is small.
+- Plugging in $D = 8192$, $F = 32{,}768$ (so $2DF = 536{,}870{,}912$ bytes):
 
 |**$Y$**|**$X$**|**Nodes per group**|**$T$ with the ring factor**|**$T$ without it**|
 |---|---|---|---|---|
@@ -529,187 +423,168 @@ All of the hardware numbers used here are collected under Reference Numbers at t
 |64|4|8|0.13 ms|0.17 ms|
 |128|2|16|0.04 ms|0.08 ms|
 
-- So 8-way model parallelism inside a node is free but does nothing for the outer AllGather. Past that, every doubling of $Y$ at least halves the cost. (At $Y = 256$ there's only one group and nothing left to gather.)
+- Meaning, 8-way model parallelism inside a node does nothing for the outer AllGather, and past that every doubling of $Y$ at least halves the cost.
 
 ### Quiz 4: Collectives
 
 **Question 1 [SU AllGather]:** Take one SU with $M$ nodes of $N$ GPUs each and run an AllGather across all of it. Exactly how many bytes go into and out of a node-level switch? And the top-level switch?
 
-- Call the array $B$ bytes. Each of the $MN$ GPUs starts with $\frac{B}{MN}$ and has to end up with all of it. We treat each node as one switch with $N$ GPUs below it and one uplink above it, and follow the bytes through.
-- **Node switch, in from its GPUs:** $N \cdot \frac{B}{MN} = \frac{B}{M}$.
-- **Node switch, out to the top:** the same $\frac{B}{M}$, since the rest of the SU needs this node's data.
-- **Node switch, in from the top:** everything the node is missing, $\frac{B(M - 1)}{M}$.
-- **Node switch, out to its GPUs:** every GPU needs all but its own shard, so $N \cdot \left(B - \frac{B}{MN}\right) = NB - \frac{B}{M}$.
+- Call the array $B$ bytes, so each of the $MN$ GPUs starts with $\frac{B}{MN}$. Treat each node as one switch with $N$ GPUs below and one uplink above, and follow the bytes:
+  - In from its GPUs, $N \cdot \frac{B}{MN} = \frac{B}{M}$, and the same $\frac{B}{M}$ out to the top.
+  - In from the top, everything the node is missing: $\frac{B(M - 1)}{M}$.
+  - Out to its GPUs, all but each one's own shard: $N \cdot \left(B - \frac{B}{MN}\right) = NB - \frac{B}{M}$.
 
   $$
   \text{Ingress} = \frac{B}{M} + \frac{B(M - 1)}{M} = \mathbf{B} \qquad \text{Egress} = \frac{B}{M} + NB - \frac{B}{M} = \mathbf{NB}
   $$
 
 - **Top-level switch:** $\frac{B}{M}$ arrives from each of the $M$ nodes, so $\mathbf{B}$ in. Each node gets back the $\frac{B(M - 1)}{M}$ it's missing, so $\mathbf{B(M - 1)}$ out.
-- Counting shard by shard for $M = 32$ and $N = 8$ gives the same thing: $1B$ in and $8B$ out at a node switch, $1B$ in and $31B$ out at the top.
-- Egress is the bigger number at both levels, so that's what sets the time. At the node, each GPU receives $B \left(1 - \frac{1}{MN}\right)$ at 450 GB/s, so about $B / 450\text{e}9$. At the top, each node receives $\frac{B(M - 1)}{M}$ at 400 GB/s:
+- Egress sets the time at both levels. At the node each GPU receives about $B$ at 450 GB/s; at the top each node receives $\frac{B(M - 1)}{M}$ at 400 GB/s:
 
   $$
   T_{\text{node}} \approx \frac{B}{450 \times 10^9} \qquad T_{\text{top}} = \frac{B \cdot (M - 1)}{M \times 400 \times 10^9} = \frac{B}{413 \times 10^9} \text{ for } M = 32
   $$
 
-- The top level is the slower of the two. So an AllGather over a whole SU runs at about 413 GB/s, not far off what we get inside a single node.
+- The top level is slower, so an AllGather over a whole SU runs at about 413 GB/s, not far off a single node.
 
 **Question 2 [single-node SHARP AR]:** Now a single node of $N$ GPUs doing an AllReduce with SHARP (in-network reductions). Exactly how many bytes does the switch take in and send out?
 
-- Every GPU starts with its own unreduced copy of the array, $B$ bytes each, and all $N$ copies need summing. Think of the array as $N$ chunks of $\frac{B}{N}$, with GPU $j$ in charge of finishing chunk $j$.
-- **Step 1:** each GPU sends the switch every chunk except its own, $\frac{B(N - 1)}{N}$ bytes. Switch ingress: $N \cdot \frac{B(N - 1)}{N} = B(N - 1)$.
-- **Step 2:** the switch adds up what it received for each chunk and sends that partial sum of chunk $j$ to GPU $j$. Switch egress: $N \cdot \frac{B}{N} = B$.
-- **Step 3:** GPU $j$ adds its own copy of chunk $j$, which finishes that chunk, and sends it back. Switch ingress: $B$.
-- **Step 4:** the switch multicasts each finished chunk to the other $N - 1$ GPUs, so every GPU receives $\frac{B(N - 1)}{N}$. Switch egress: $B(N - 1)$.
+- Every GPU starts with its own unreduced $B$-byte copy. Split the array into $N$ chunks of $\frac{B}{N}$, with GPU $j$ in charge of finishing chunk $j$.
+- **Step 1:** each GPU sends the switch every chunk but its own. Ingress $N \cdot \frac{B(N - 1)}{N} = B(N - 1)$.
+- **Step 2:** the switch sums each chunk and sends the partial sum of chunk $j$ to GPU $j$. Egress $N \cdot \frac{B}{N} = B$.
+- **Step 3:** GPU $j$ adds its own copy, which finishes the chunk, and sends it back. Ingress $B$.
+- **Step 4:** the switch multicasts each finished chunk to the other $N - 1$ GPUs. Egress $B(N - 1)$.
 
   $$
   \text{Ingress} = B(N - 1) + B = \mathbf{NB} \qquad \text{Egress} = B + B(N - 1) = \mathbf{NB}
   $$
 
-- Per GPU that's exactly $B$ bytes out and $B$ bytes in. So the time is exactly $B / W_{\text{GPU}}$, with no $\frac{N - 1}{N}$ factor this time.
-- Without SHARP each GPU would egress $\frac{2B(N - 1)}{N}$ (a ReduceScatter plus an AllGather), which is $1.75B$ for $N = 8$. So the theoretical speedup is $1.75\times$, and that's the "75%" that turns into roughly 30% in practice.
+- Per GPU that's exactly $B$ out and $B$ in, so the time is exactly $B / W_{\text{GPU}}$, no $\frac{N - 1}{N}$ this time.
+- Without SHARP each GPU egresses $\frac{2B(N - 1)}{N}$ (ReduceScatter plus AllGather), $1.75B$ for $N = 8$. So the theoretical speedup is $1.75\times$, the "75%" that turns into roughly 30% in practice.
 
 **Question 3 [cross-node SHARP AR]:** An array $\text{bf16}[D_X, F_Y]$ is sharded over the $N$ GPUs of one node. With in-network reductions, how long does $\text{AllReduce}(\text{bf16}[D, F_Y] \{U_X\})$ take? What changes once there's more than one node?
 
-- Decoding the notation: the node's $N = XY$ GPUs each hold an unreduced $\text{bf16}[D, F/Y]$, which is $\frac{2DF}{Y}$ bytes, and the $X$ GPUs that share a slice of $F$ need to sum theirs.
-- That's just Question 2 happening $Y$ times side by side, each on an array of $\frac{2DF}{Y}$ bytes. Each GPU egresses $\frac{2DF}{Y} \cdot \frac{X - 1}{X}$, gets $\frac{2DF}{XY}$ back, returns it, and finally receives $\frac{2DF}{Y} \cdot \frac{X - 1}{X}$. So $\frac{2DF}{Y}$ in each direction per GPU:
+- Decoding the notation: the node's $N = XY$ GPUs each hold an unreduced $\text{bf16}[D, F/Y]$, which is $\frac{2DF}{Y}$ bytes, and the $X$ GPUs sharing a slice of $F$ sum theirs.
+- That's just Question 2 running $Y$ times side by side on $\frac{2DF}{Y}$ bytes each, so $\frac{2DF}{Y}$ each way per GPU:
 
   $$
   T_{\text{comms}} = \mathbf{\frac{2DF}{Y \cdot W_{\text{GPU}}}} = \frac{2DF}{Y \times 450 \times 10^9} \text{ s}
   $$
 
-- Inside a node, then, sharding over $Y$ helps in full. With $(X, Y) = (4, 2)$ the reduction sees an effective 900 GB/s, and with $(2, 4)$ it sees 1.8 TB/s.
-- **More than one node:** now the reduction over $X$ has to cross nodes. A node still holds $Y$ different slices of $F$, and those can't be summed with each other (they're different parts of the array). So the node has to send all of them up: $2DF$ bytes through its 400 GB/s uplink, not $\frac{2DF}{Y}$.
+- Inside a node, sharding over $Y$ helps in full: $(X, Y) = (4, 2)$ sees an effective 900 GB/s, and $(2, 4)$ sees 1.8 TB/s.
+- **More than one node:** now the reduction over $X$ crosses nodes. A node still holds $Y$ different slices of $F$, which can't be summed with each other, so it sends all of them up: $2DF$ bytes through its 400 GB/s uplink.
 
   $$
   T_{\text{comms}} = \frac{2DF}{W_{\text{node}}} = \frac{2DF}{400 \times 10^9} \text{ s}
   $$
 
-- The $Y$ has disappeared. Going from $(2, 4)$ inside a node to the same thing across nodes takes us from 1.8 TB/s to 400 GB/s, which is $4.5\times$ slower. Same lesson as Pop Quiz 3.
+- The $Y$ is gone. Going from $(2, 4)$ in one node to the same thing across nodes drops us from 1.8 TB/s to 400 GB/s, $4.5\times$ slower. Same lesson as Pop Quiz 3.
 
 **Question 4 [spine level AR cost]:** Same setup as Question 3, except $Y = 256$, which pushes the AllReduce up to the spine level. How long does it take, again with in-network reductions?
 
-- With $Y = 256$ each slice of $F$ lives on exactly one GPU in an SU, and the $X = 4$ SUs of the SuperPod are what we reduce over. So this is Pop Quiz 3's second case taken as far as it goes.
-- Each GPU holds $\frac{2DF}{256}$ bytes and, with SHARP, sends and receives exactly that much through its own 50 GB/s NIC. All 256 GPUs in the SU can do that at once, because the fat tree gives each SU 12.8 TB/s up to the spine ($8 \times 16 \times 2$ cables at 50 GB/s, or 51.2 TB/s over 4 SUs):
+- With $Y = 256$ each slice of $F$ lives on exactly one GPU per SU, and we reduce over the $X = 4$ SUs. Basically Pop Quiz 3's second case taken all the way.
+- Each GPU holds $\frac{2DF}{256}$ bytes and, with SHARP, sends and receives exactly that through its own 50 GB/s NIC. All 256 can do it at once, since the fat tree gives each SU 12.8 TB/s up to the spine:
 
   $$
   T_{\text{comms}} = \frac{2DF}{256 \times 50 \times 10^9} = \mathbf{\frac{2DF}{12.8 \times 10^{12}} \text{ s}}
   $$
 
-- That's $32\times$ the bandwidth of the $Y \le 8$ case. For the $D = 8192$, $F = 32{,}768$ array from Pop Quiz 3 it comes to around 42 μs instead of 1.34 ms.
-- Without SHARP it would be $2 \cdot \frac{X - 1}{X} = 1.5\times$ longer.
+- That's $32\times$ the bandwidth of the $Y \le 8$ case. For the Pop Quiz 3 array it comes to around 42 μs instead of 1.34 ms. Without SHARP it would be $2 \cdot \frac{X - 1}{X} = 1.5\times$ longer.
 
 **Question 5 [2-way AllGather cost]:** What does an AllGather of $B$ bytes cost over exactly 2 nodes? Keep the exact ring factors instead of the usual approximation, and work out the intra-node cost as well as the cross-node one.
 
-- 2 nodes is 16 GPUs with $\frac{B}{16}$ each. There are two links to check: the InfiniBand hop between the nodes and the NVLink ring inside each one.
-- **Cross-node:** each node is missing the other node's half, $\frac{B}{2}$, and pulls it in at 400 GB/s. This is the usual ring formula with $M = 2$:
+- 2 nodes is 16 GPUs with $\frac{B}{16}$ each. Two links to check: the InfiniBand hop between nodes and the NVLink ring inside each.
+- **Cross-node:** each node is missing the other half, $\frac{B}{2}$, and pulls it in at 400 GB/s. The usual ring formula with $M = 2$:
 
   $$
   T_{\text{cross}} = \frac{B \cdot (M - 1)}{M \cdot W_{\text{node}}} = \frac{B}{2 \times 400 \times 10^9} = \frac{B}{800 \times 10^9}
   $$
 
-- **Intra-node:** each GPU's NIC brings in $\frac{1}{8}$ of that remote half, so every GPU now "owns" $\frac{B}{8}$ (its own $\frac{B}{16}$ plus $\frac{B}{16}$ of remote data). The other $\frac{7B}{8}$ has to reach it over NVLink:
+- **Intra-node:** each GPU's NIC brings in $\frac{1}{8}$ of the remote half, so every GPU now owns $\frac{B}{8}$ (its own $\frac{B}{16}$ plus $\frac{B}{16}$ remote). The other $\frac{7B}{8}$ reaches it over NVLink:
 
   $$
   T_{\text{node}} = \frac{B \cdot (N - 1)}{N \cdot W_{\text{GPU}}} = \frac{7B}{8 \times 450 \times 10^9} = \mathbf{\frac{B}{514 \times 10^9} \text{ s}}
   $$
 
-- The $\frac{7}{8}$ is the solution's factor, and it's what the section's per-level ring formula gives. It depends on each GPU pulling its share of the remote half through its own NIC. If we treated the node as a strict tree instead, with the whole remote half fanned out over NVLink as well, each GPU would receive $\frac{15B}{16}$ that way and the node term would be $B / 480\text{e}9$. NVLink is the limit under both readings.
-- The node level is the slower one, by about $1.56\times$. So a 2-node AllGather is bound by NVLink and not by InfiniBand, and it runs at 514 GB/s, the same as a single node.
-- Compare that with a full SU, where the cross-node term is $B / 413\text{e}9$ and takes over. With only 2 nodes, the $\frac{M - 1}{M}$ factor hands us double the cross-node bandwidth. This is the "2-node discount" from the notes, and it's the reason 2-way data parallelism shows up so often.
+- The node level is slower by about $1.56\times$. So a 2-node AllGather is bound by NVLink, not InfiniBand, and runs at 514 GB/s, same as one node.
+- Compare a full SU, where the cross-node term is $B / 413\text{e}9$ and takes over. With 2 nodes, the $\frac{M - 1}{M}$ factor doubles the cross-node bandwidth. That's the "2-node discount" from the notes, and why 2-way data parallelism shows up so often.
 
 ### Quiz 5: LLM rooflines
 
 **Question 1 [B200 rooflines]:** A B200 DGX SuperPod (NOT the GB200 NVL72) has $2\times$ the bandwidth within a node (900 GB/s of GPU egress) but the same bandwidth in the scale-out network (400 GB/s per node). The FLOPs/s are in the reference table. How does this change the model-parallel and data-parallel rooflines?
 
-- Every roofline in the notes depends on the hardware through one ratio, $C/W$. So we just recompute it for both levels and see what moves.
-- $C$ goes from 990e12 to 2250e12 FLOPs/s (the solution's inputs), about $2.27\times$ (the solution says $2.25\times$). Inside a node $W$ doubles; across nodes it doesn't change.
+- Every roofline in the notes sees the hardware through $C/W$, so we just recompute it. $C$ goes from 990e12 to 2250e12 FLOPs/s, about $2.27\times$; $W$ doubles inside a node and stays put across nodes.
 
   $$
   \text{In a node: } \frac{2250 \times 10^{12}}{900 \times 10^9} = \mathbf{2{,}500} \qquad \text{Across nodes: } \frac{2250 \times 10^{12}}{400 \times 10^9} = \mathbf{5{,}625}
   $$
 
-- For the H100 these were 2,200 and 2,475.
-- **Model parallelism (TP):** the limit inside a node goes from $Y < F/2200$ to $Y < F/2500$. For $F = 28{,}672$ that's 13.0 down to 11.5, both still above the 8 GPUs a node actually has. Nothing really changes. Across nodes it goes from $F/2475$ to $F/5625$, which is only about 5 for the same $F$, so cross-node TP gets worse.
+- **Model parallelism (TP):** inside a node the limit goes from $F/2200$ to $F/2500$. For $F = 28{,}672$ that's 13.0 down to 11.5, both still above a node's 8 GPUs, so nothing really changes. Across nodes it goes from $F/2475$ to $F/5625$, only about 5, so cross-node TP gets worse.
 - **Data parallelism:** the reduction crosses nodes, so the per-GPU batch we need jumps from 2,475 to **5,625 tokens**.
-- (With the table's rounded 2.3e15 the two ratios are 2,556 and 5,750.)
-- So a faster chip on the same network is harder to keep compute-bound, not easier. That's the problem the GB200 NVL72 goes after with its 3.6 TB/s of node egress, which brings the cross-node ratio down to 625.
+- A faster chip on the same network is harder to keep compute-bound, not easier. That's what the GB200 NVL72 goes after: 3.6 TB/s of node egress brings the cross-node ratio down to 625.
 
 **Question 2 [how to shard LLaMA-3 70B]:** We're training LLaMA-3 70B with bfloat16 weights and Adam, with the optimizer state kept in fp32.
 
 **1. What's the smallest number of H100s that can hold the weights and the optimizer state?**
 
-- Bytes per parameter: 2 for the bf16 weight, plus Adam's two moments at 4 bytes each.
+- 2 bytes per parameter for the bf16 weight, plus Adam's two moments at 4 bytes each:
 
   $$
-  70 \times 10^9 \times (2 + 8) \text{ bytes} = 140 \text{ GB} + 560 \text{ GB} = 700 \text{ GB}
+  70 \times 10^9 \times (2 + 8) \text{ bytes} = 140 \text{ GB} + 560 \text{ GB} = 700 \text{ GB} \qquad \frac{700 \text{ GB}}{80 \text{ GB per H100}} = 8.75 \implies \mathbf{9 \text{ GPUs}}
   $$
 
-  $$
-  \frac{700 \text{ GB}}{80 \text{ GB per H100}} = 8.75 \implies \mathbf{9 \text{ GPUs}}
-  $$
-
-- GPUs come in nodes of 8, so in practice that's **2 nodes**. This is only a floor: it leaves no room for gradients or activations.
+- GPUs come in nodes of 8, so in practice that's **2 nodes**. And it's only a floor, with no room for gradients or activations.
 
 **2. How long does training take on 4,096 H100s for 15T tokens at 45% MFU (Model FLOPs Utilization)?**
 
-- The $6 \times \text{parameters} \times \text{tokens}$ rule from Chapter 4 gives the total work:
+- Napkin math with the $6 \times \text{parameters} \times \text{tokens}$ rule from Chapter 4, over a cluster running at 45% of peak:
 
   $$
-  6 \times 70 \times 10^9 \times 15 \times 10^{12} = 6.3 \times 10^{24} \text{ FLOPs}
-  $$
-
-- The cluster delivers 45% of its peak:
-
-  $$
-  4{,}096 \times 990 \times 10^{12} \times 0.45 = 1.82 \times 10^{18} \text{ FLOPs/s}
+  6 \times 70 \times 10^9 \times 15 \times 10^{12} = 6.3 \times 10^{24} \text{ FLOPs} \qquad 4{,}096 \times 990 \times 10^{12} \times 0.45 = 1.82 \times 10^{18} \text{ FLOPs/s}
   $$
 
   $$
   \frac{6.3 \times 10^{24}}{1.82 \times 10^{18}} = 3.45 \times 10^6 \text{ s} \approx \mathbf{40 \text{ days}}
   $$
 
-**3. The model has $F = 28{,}672$ and its batch was about 4M tokens. How much model parallelism can we use before it's comms-bound? On 4k chips, does that much model parallelism plus pure DP stay compute-bound? Does it with ZeRO-3 instead? With 8-way pipelining added? Check the GPU memory as well as the communication cost.**
+**3. The model has $F = 28{,}672$ and a batch of about 4M tokens. How much model parallelism can we use before it's comms-bound? On 4k chips, does that plus pure DP stay compute-bound? With ZeRO-3 instead? With 8-way pipelining added? Check GPU memory as well as communication.**
 
-- **Model parallelism:** from the TP rule, inside a node we can go up to $F / 2200 = 28{,}672 / 2200 \approx 13$-way. That's more than the 8 GPUs of one node and fewer than the 16 of two, so we stop at **8-way** TP, which is comfortably compute-bound. The solution reasons the same way and also lands on 8-way (its limit is 14.4, see the TODO below).
-- What about 16-way over 2 nodes? The book isn't fully consistent here. Its 2-node rule from the notes, $F > 2475 \cdot (Y - 8)$, passes easily at $Y = 16$ since $28{,}672 > 19{,}800$, and the section's text says 16-way TP is generally possible. Its solution to this problem doesn't use that rule and stays at 8.
-- Going beyond the book: the 2-node rule only looks at the InfiniBand hop. From Quiz 4 Question 5, a 2-node AllGather is actually limited by the NVLink ring at 514 GB/s. Putting that into the TP roofline gives $F/Y > 2200 \times \frac{7}{8} = 1{,}925$, so $Y < 14.9$, and $F/16 = 1{,}792$ falls about 7% short. This check is ours and not the book's. It points the same way as the solution though: 16-way is borderline at best, and 8-way is the safe answer.
-- **TODO(eddie):** the solution divides by 1995 here ($28{,}672 / 1995 = 14.4$) where the notes give $990\text{e}12 / 450\text{e}9 = 2200$ (so 13.0). It isn't clear where 1995 comes from; we couldn't rebuild it from the section's FLOPs/s, bandwidths and ring factors. The conclusion is the same either way, since the node size caps it at 8. Also decide whether to keep the 16-way aside: the section's text allows 16-way, its solution doesn't, and the NVLink argument is our own.
-- **8-way TP plus pure DP:** that's $4{,}096 / 8 = 512$ replicas. Memory first: every replica keeps its own 700 GB of weights and optimizer state on 8 GPUs, which is 87.5 GB per GPU. An H100 has 80. It doesn't fit, so **no**.
-- It fails on communication too. The per-GPU batch is $4 \times 10^6 / 4{,}096 \approx 977$ tokens, and data parallelism across nodes needs 2,475. We're about $2.5\times$ short (we'd need a 10M token batch).
-- The 8 versus 16 question doesn't change this verdict. With 16-way TP the memory would fit ($700 / 16 = 43.75 \text{ GB}$ per GPU), and spanning 2 nodes would halve the threshold to about 1,238, but 977 is still under it.
-- **ZeRO-3:** this fixes the memory, since everything is now sharded over all 4,096 GPUs (around 0.17 GB each). It doesn't fix the communication: the roofline is the same 2,475 tokens per GPU and we still have 977. So **no**.
-- The solution says ZeRO-3's limit is twice the pure DP one (so 4,950) because the weights have to move too. The data parallelism rule in the notes above and Chapter 5 both treat the two as the same cost, since a ReduceScatter plus an AllGather moves the same bytes as an AllReduce. Either way we're under it. **TODO(eddie):** pick one to state; the book's solution and its own text disagree here.
-- **8-way pipelining:** now each replica is 8-way TP times 8 pipeline stages, so 64 GPUs spread over 8 nodes, with $4{,}096 / 64 = 64$-way DP on top. Each node holds only $\frac{1}{8}$ of the layers, so it only has to move $\frac{1}{8}$ of the weights in the data-parallel reduction. Effectively the bandwidth goes from 400 GB/s to $8 \times 400 = 3{,}200 \text{ GB/s}$:
+- **Model parallelism:** inside a node we can go up to $F / 2200 = 28{,}672 / 2200 \approx 13$-way, more than one node's 8 GPUs, so we stop at **8-way** TP, comfortably compute-bound. The solution lands on 8-way too.
+- 16-way over 2 nodes passes the 2-node rule ($28{,}672 > 19{,}800$), but that rule only looks at the InfiniBand hop. Quiz 4 Question 5 showed a 2-node AllGather is really NVLink-bound at 514 GB/s, which makes the limit $F/Y > 2200 \times \frac{7}{8} = 1{,}925$, so $Y < 14.9$. Borderline at best.
+- **TODO(eddie):** the solution divides by 1995 here ($28{,}672 / 1995 = 14.4$) where the notes give $990\text{e}12 / 450\text{e}9 = 2200$ (so 13.0). It isn't clear where 1995 comes from in the section's numbers; the node size caps it at 8 either way. Also decide whether to keep the 16-way aside: the section's text allows 16-way, its solution doesn't, and the NVLink argument is our own.
+- **8-way TP plus pure DP:** that's $4{,}096 / 8 = 512$ replicas, each keeping its own 700 GB on 8 GPUs, so 87.5 GB per GPU against the H100's 80. Doesn't fit, so **no**.
+- It fails on comms too: the per-GPU batch is $4 \times 10^6 / 4{,}096 \approx 977$ tokens against the 2,475 that cross-node DP needs, about $2.5\times$ short (we'd need a 10M token batch). 16-way TP wouldn't save it either. Memory would fit ($700 / 16 = 43.75 \text{ GB}$ per GPU), but even the 2-node threshold of about 1,238 is above 977.
+- **ZeRO-3:** sharding everything over all 4,096 GPUs fixes the memory (around 0.17 GB each) but not the comms: same 2,475 tokens per GPU, and we still have 977. So **no**.
+- The solution puts ZeRO-3's limit at twice pure DP (4,950) because the weights move too, while the notes and Chapter 5 count the two as the same cost. We're under either way. **TODO(eddie):** pick one to state; the solution and the section's text disagree here.
+- **8-way pipelining:** each replica is now 8-way TP times 8 stages, 64 GPUs over 8 nodes, with $4{,}096 / 64 = 64$-way DP on top. Each node only holds $\frac{1}{8}$ of the layers, so it only moves $\frac{1}{8}$ of the weights in the DP reduction, and the effective bandwidth goes from 400 GB/s to $8 \times 400 = 3{,}200 \text{ GB/s}$:
 
   $$
   \frac{C}{W} = \frac{990 \times 10^{12}}{3{,}200 \times 10^9} \approx \mathbf{309 \text{ tokens per GPU}}
   $$
 
-- We have 977, about $3.2\times$ more than we need, so we're compute-bound. Memory is fine too: $700 / 64 \approx 10.9 \text{ GB}$ per GPU even with every replica holding a full copy.
-- So **yes**: 8-way TP, 8-way PP and 64-way DP works on paper. What's left is implementing the pipelining well, and using ZeRO-1 rather than ZeRO-3 with it.
+- We have 977, about $3.2\times$ more than we need, so we're compute-bound. Memory is fine too: $700 / 64 \approx 10.9 \text{ GB}$ per GPU.
+- So **yes**: 8-way TP, 8-way PP and 64-way DP works on paper, with ZeRO-1 rather than ZeRO-3 and a decent pipeline implementation.
 
-**Question 3 [Megatron-LM hyperparams]:** The book shows a figure from the Megatron-LM repository with the hyperparameters behind their high MFU numbers. Every config uses a sequence length of 4096. What per-GPU batch size, in tokens, do the 16B, 70B and 314B models run at? Take data parallelism as the outermost axis and bfloat16 reductions: on paper, is each config compute-bound or communication-bound, and could any of them be configured better?
+**Question 3 [Megatron-LM hyperparams]:** A figure from the Megatron-LM repository lists the hyperparameters behind their high MFU numbers. Every config uses a sequence length of 4096. What per-GPU batch size, in tokens, do the 16B, 70B and 314B models run at? Take data parallelism as the outermost axis and bfloat16 reductions: on paper, is each config compute-bound or communication-bound, and could any of them be configured better?
 
-- The figure isn't reproduced here, so we use the configs the book's solution reads off it: the 16B model has a batch of 192 sequences on 192 GPUs, the 70B has 384 on 768 GPUs with 16-way model parallelism (TP times PP), and the 314B has 1,536 on 3,072 GPUs with 64-way model parallelism.
+- We use the configs the solution reads off the figure: 16B has 192 sequences on 192 GPUs, 70B has 384 on 768 GPUs with 16-way model parallelism (TP times PP), and 314B has 1,536 on 3,072 GPUs with 64-way.
 - **Per-GPU batch:** sequences times 4096 tokens, divided by GPUs.
 
   $$
   \text{16B: } \frac{192 \times 4096}{192} = \mathbf{4{,}096} \qquad \text{70B: } \frac{384 \times 4096}{768} = \mathbf{2{,}048} \qquad \text{314B: } \frac{1{,}536 \times 4096}{3{,}072} = \mathbf{2{,}048}
   $$
 
-- **Thresholds:** with DP outermost, the gradient reduction crosses nodes, so the base requirement is $C/W = 2{,}475$ tokens per GPU. Then we divide by the number of nodes each model replica spans. (The solution writes 2,472 at this point, which looks like a slip for the 2,475 in the section's text.)
-- **16B:** 4,096 against 2,475. Compute-bound, with about $1.65\times$ to spare, and that holds even if its model parallelism stays inside one node.
-- **70B:** 16-way model parallelism is 2 nodes, so the threshold is $2{,}475 / 2 \approx 1{,}238$. We have 2,048. Compute-bound, again by about $1.65\times$.
-- **314B:** 64-way is 8 nodes, so the threshold is $2{,}475 / 8 \approx 309$. We have 2,048. Compute-bound by a factor of about 6.6.
-- So all three are compute-bound in theory (the solution rounds the last two thresholds to roughly 1k and 300), and the two bigger ones only because their model parallelism spans several nodes. With everything inside one node, 2,048 tokens per GPU would be under the 2,475 line.
-- **Is there something better?** The 16B and 70B configs have about $1.65\times$ of headroom, which isn't much once we remember that the collective bandwidth the book measures falls well short of the spec. The 314B has the most slack: on paper the same batch could be spread over roughly $6.6\times$ more GPUs, or the per-GPU batch could drop towards 300 tokens, before communication takes over.
-- **TODO(eddie):** check the TP and PP columns of the Megatron-LM figure. The 16-way and 64-way numbers are taken from the book's solution, and the 16B model's split isn't stated there at all.
+- **Thresholds:** with DP outermost the gradient reduction crosses nodes, so the base requirement is $C/W = 2{,}475$ tokens per GPU, divided by the number of nodes a replica spans. (The solution writes 2,472 here, which looks like a typo.)
+- **16B:** 4,096 against 2,475, so compute-bound with about $1.65\times$ to spare, even inside one node.
+- **70B:** 16-way is 2 nodes, so $2{,}475 / 2 \approx 1{,}238$ against 2,048. About $1.65\times$ again.
+- **314B:** 64-way is 8 nodes, so $2{,}475 / 8 \approx 309$ against 2,048. Compute-bound by a factor of about 6.6.
+- All three are compute-bound in theory, the two bigger ones only because their model parallelism spans several nodes.
+- **Is there something better?** $1.65\times$ of headroom isn't much for the 16B and 70B, given that measured collective bandwidth falls well short of spec. The 314B has the most slack: the same batch could spread over roughly $6.6\times$ more GPUs, or the per-GPU batch could drop towards 300 tokens.
+- **TODO(eddie):** check the TP and PP columns of the Megatron-LM figure. The 16-way and 64-way numbers come from the solution, and the 16B model's split isn't stated there at all.
 
 ## Reference Numbers
 
-GPU specs for the models the book tabulates. The V100 has no bf16 Tensor Core figure listed.
+GPU specs from our references. The V100 has no bf16 Tensor Core figure listed.
 
 |**Model**|**SMs/chip**|**SMEM/SM**|**L2/chip**|**HBM capacity/chip**|**HBM BW/chip (bytes/s)**|**FLOPs/s (bf16/fp16)**|**FLOPs/s (fp8/int8)**|**FLOPs/s (fp4)**|
 |---|---|---|---|---|---|---|---|---|
@@ -719,7 +594,7 @@ GPU specs for the models the book tabulates. The V100 has no bf16 Tensor Core fi
 |**H200**|132|256kB|50MB|141GB|4.8e12|9.9e14|2.0e15|n/a|
 |**B200**|148|256kB|126MB|192GB|8.0e12|2.3e15|4.5e15|9.0e15|
 
-> Every generation has 256kB of register memory per SM, and the B200 adds 256kB of TMEM per SM. Clock speeds are 1.59GHz (1.98GHz boost) for the H100 and H200; the B200's isn't published. The book gives two values for a few of these. For the H100 its text and solutions use 990e12 FLOPs/s and 3.35e12 bytes/s, which this table rounds to 9.9e14 and 3.4e12. For the B200 some solutions use 2250e12 FLOPs/s (Quiz 1 Question 3, Quiz 5 Question 1) and others the table's 2.3e15 (Quiz 1 Question 4), and the text quotes the HBM bandwidth as 9 TB/s against the table's 8.0e12, which is what the solutions use.
+> Every generation has 256kB of register memory per SM, and the B200 adds 256kB of TMEM per SM. Clocks are 1.59GHz (1.98GHz boost) for the H100 and H200; the B200's isn't published.
 
 ### Interconnect Figures
 
@@ -747,4 +622,4 @@ Egress by node type, which is what the rooflines use:
 |**B200**|8|900e9|400e9|
 |**GB200 NVL72**|72|900e9|3600e9|
 
-All of these are full-duplex, so the number applies in each direction at once. An NVSwitch has 64 ports at the NVLink speed. The InfiniBand links and switch ports are 400 Gbps, which is 50 GB/s, with 64 ports per switch (3.2 TB/s). Each GPU has one InfiniBand NIC, so a node's egress is 8 times 50 GB/s. In the book's measurements NVLink collectives top out around 370 GB/s instead of 450.
+All of these are full-duplex. An NVSwitch has 64 ports at NVLink speed; InfiniBand ports are 400 Gbps (50 GB/s), 64 per switch (3.2 TB/s), with one NIC per GPU. Measured NVLink collectives top out around 370 GB/s instead of 450.
