@@ -55,7 +55,7 @@ The following section covers transformer accounting, which can be found in more 
 
 - **$B$:** Batch size (number of sequences processed at once; for local models, 1 = just you)
     
-- **$T$ (or $S$):** Sequence Length (4096 or 8192 words, etc)
+- **$T$ (or $S$):** Sequence Length (4096 or 8192 tokens, etc)
     
 - **$D$:** Model dimension (core width of the network)
     
@@ -91,7 +91,7 @@ The MLP (feed forward) block contains the vast majority of parameters in a trans
 
 - **Parameters:** 3 Matrices of size $D \times F$, so $3DF$ total.
     
-- **Train FLOPs:** Applying the $6\times$ rule to a batch of $B$ sequences of length $T$, we get $6BT \times 3DF$ to $18BTDF$ FLOPs.
+- **Train FLOPs:** Applying the $6\times$ rule to a batch of $B$ sequences of length $T$, we get $6BT \times 3DF = 18BTDF$ FLOPs.
     
 
 ### 2. Attention Budget (Projections vs Dot Products)

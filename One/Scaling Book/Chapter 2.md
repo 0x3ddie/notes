@@ -30,7 +30,7 @@ Our goal is to shoot towards being compute-bound instead of memory-bound; this i
 
 ## On VMEM
 
-VMEM is typically the solution to being memory-bound. It’s lightning fast compared to HBM (around $22\times$ faster, although with a capacity in the MB), while HBM has massive capacity. So we have an imbalance here:
+VMEM is typically the solution to being memory-bound. It’s lightning fast compared to HBM (around $22\times$ faster on a v5e, or about $7\times$ on the newer TPU7x, although with a capacity in the MB), while HBM has massive capacity. So we have an imbalance here:
 
 - The MXU basically instantly finishes our math; to keep our MXU running at 100% efficiency, we need a high arithmetic intensity of around **240** when pulling data from HBM.
     
@@ -46,7 +46,7 @@ To summarize the system:
 - Reading from the **VMEM** provides a perfect, constant feed of data, requiring an intensity of only 10-20, causing our system to be compute-bound instead.
     
 
-If we can engineer our algorithm so that our working data fits perfectly within the VMEM, it is almost a given that we’ll avoid traditional memory-bound issues and default to compute-bound. However, because the cache is so small (few MBs), this is often very challenging.
+If we can engineer our algorithm so that our working data fits perfectly within the VMEM, it is almost a given that we’ll avoid traditional memory-bound issues and default to compute-bound. However, because the cache is so small (128 MiB on a v5e), this is often very challenging.
 
 ## On Chip Layouts
 
