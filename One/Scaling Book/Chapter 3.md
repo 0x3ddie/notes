@@ -107,11 +107,15 @@ $$
 \text{AllReduce} = \text{ReduceScatter} + \text{AllGather}
 $$
 
-We just went over 3 communication primitives: AllGather, ScatterReduce, All Reduce. There is a 4th: AllToAll.
+We just went over 3 communication primitives: AllGather, ReduceScatter, All Reduce. There is a 4th: AllToAll.
 
 All to All appears in MoE models, and concerns the sharded transposition, or resharding operations.
 
 AlltoAll is purely a rearrangement primitive, and is $\frac{1}{4}$ the cost of an AllGather. This takes place when our current sharding structure, such as an $A[I_x,J]$ is incompatible with the math we need to do next, which requires an $A[I,J_x]$. Thus, we need to transpose those rows into columns, or vice versa. The way this happens is by every TPU chopping up it’s data into tiny blocks, and shipping them along a ring. Each TPU then has 1 block of each row, ending up in a column.
+
+### Both multiplicands have a non-contracting dimension sharded on the same axis
+
+The 4th case, like $A[I_x,J] * B[J,K_x]$. The output would have to be $C[I_x,K_x]$, but a mesh axis can only shard one dimension of an array, so this isn't allowed. Chip $i$ only holds the $i$th block of rows of $A$ and the $i$th block of columns of $B$, so it could only ever compute the diagonal block of $C$. The fix is to AllGather one of the inputs first, like $A[I_x,J] \to A[I,J]$, which puts us back in case 1 with $C[I,K_x]$.
 
 > **Note:** you can find useful GIFs on [jax-ml.github.io/scaling-book/sharding/](https://jax-ml.github.io/scaling-book/sharding/) for references on each primitive, or ask Gemini to visualize the methods/math (like asking TPUs to explain TPUs fr)
 
@@ -120,9 +124,9 @@ To conclude on sharding: There are 4 main communication primitives that define h
 ### Problem Set
 
 **Pop Quiz [2D sharding across 1 axis]:** Consider an array `fp32[1024, 4096]` with sharding A[I XY,J] and mesh `{'X': 8, 'Y': 2}`. How much data is held by each device? How much time would it take to load this array from HBM on H100s (assuming `3.4e12` memory bandwidth per chip)?
-- Our Mesh means we have an 8x2 grid setup of TPUs, or 16 TPUs total. 
-- Our array is fp32, so the total bytesize is 4x1024x4096 = 
-- We're told that our array A [I,J] has [I] sharded across X and Y, and J is untouched. This tells us that each individual TPU gets 100% of the columns J and 1/16 of the rows I. 1024/16 = 64, so each TPU gets [64,4096]. Total elements comes to 262,144, x4 = 1048576 bytes.
+- Our Mesh means we have an 8x2 grid setup of H100s, or 16 GPUs total. 
+- Our array is fp32, so the total bytesize is 4x1024x4096 = 16,777,216 bytes (16 MiB).
+- We're told that our array A [I,J] has [I] sharded across X and Y, and J is untouched. This tells us that each individual GPU gets 100% of the columns J and 1/16 of the rows I. 1024/16 = 64, so each GPU gets [64,4096]. Total elements comes to 262,144, x4 = 1048576 bytes.
 - $$
   \text{HBM Load Time} = \frac{1{,}048{,}576 \text{ bytes}}{3.4 \times 10^{12} \text{ bytes/s}}
   $$
@@ -135,11 +139,11 @@ To conclude on sharding: There are 4 main communication primitives that define h
 **Pop Quiz 2 [AllGather time]:** Using the numbers from Part 2, how long does it take to perform the $\text{AllGather}_Y([E_Y, F]) \rightarrow [E, F]$ on a TPU v5e with a 2D mesh `{'X': 8, 'Y': 4}`, where $E = 2048, F = 8192$ in bfloat16? What about with $E = 256, F = 256$?
 * **Part 1 Matrix Configuration ($E = 2048, F = 8192$):**
 	* We have 32 TPUs in a grid that is 8 chips wide and 4 chips tall, so 8 columns. Our AllGatherY operation means that all our chips only pass data to their vertical neighbors. This might be a bit confusing, but we have our normal TPU configurations but the operation itself concerns each chip and their vertical neighbors. So our AllGatherY operation means that our chips just move along the vertical line instead of towards everybody else. And as we gather all our shards 'vertically' it should come together as a complete E.
-	* This is where we need to look at the mesh configurations too. Because its a 2D flat mesh, there's no wraparound cable that connects the 'bottom' chip directly to the top chip that you would see in a 3D Torus config with wraparound cables. Meaning, we're throttled by the bottom chip that needs to travel through the other chips vertically. So we're stuck with unidirectional ICI bandwidth.
+	* This is where we need to look at the mesh configurations too. A v5e only has wraparound cables on an axis with the full 16 chips, and our Y axis only has 4, so there's no wraparound cable that connects the 'bottom' chip directly to the top chip. Meaning, we're throttled by the bottom chip that needs to travel through the other chips vertically. So we're stuck with unidirectional ICI bandwidth.
 	-  $$
 	   \text{Local Shard Shape} = \text{bf16}[512, 8192] \rightarrow 512 \times 8192 \times 2 \text{ bytes} \approx 8.4\text{ MB}
 	   $$
-	- Each local shard is 8.4MB, and since we have 4 chips per Y, we split the E row by 4, so 512 elements. That means that for all 8 of our rows, we eventually end up with 8 identical arrays of a finished A[E,F]. We can imagine the shard at the bottom of each column travelling through 3 more chips to get to the top for the AllGather, since we're forced to be unidirectional. Hopping 3 times means:
+	- Each local shard is 8.4MB, and since we have 4 chips per Y, we split the E row by 4, so 512 elements. That means that in all 8 of our columns, every chip eventually ends up with a finished A[E,F], so 32 identical copies. We can imagine the shard at the bottom of each column travelling through 3 more chips to get to the top for the AllGather, since we're forced to be unidirectional. Hopping 3 times means:
 	- $$
 	  \text{T}_{\text{comms}} = \frac{3 \times 8.4 \times 10^6 \text{ bytes}}{4.5 \times 10^{10} \text{ bytes/s}} = \mathbf{560 \ \mu\text{s}}
 	  $$
@@ -150,7 +154,7 @@ To conclude on sharding: There are 4 main communication primitives that define h
 	- If we change our E = 256 and F = 256,
 
 	  $$
-	  \text{Streaming term} = \frac{32 \times 10^3 \text{ bytes}}{4.5 \times 10^{10} \text{ bytes/s}} = 0.7 \text{ ns} \rightarrow \text{Negligible}
+	  \text{Streaming term} = \frac{32 \times 10^3 \text{ bytes}}{4.5 \times 10^{10} \text{ bytes/s}} = 0.7 \ \mu\text{s} < 1 \ \mu\text{s per hop}
 	  $$
 	- Meaning we're latency-bound with our 3 microsecond hop latency as a minimum.
 
@@ -176,8 +180,8 @@ The hardware configuration is `Mesh({'X': 4, 'Y': 4, 'Z': 4})`.
 
 The hardware configuration is `Mesh({'X': 2, 'Y': 8, 'Z': 4})`.
 **How much memory does a single shard take up on an individual device?**
-- Because we shard I along X and Y, we end up with I/16. Meaning, each shard gets 0.5 of an I element, or 1 byte. 
-	- FYI: This goes into fractional sharding. Physically we cannot hold half of a matrix element, so we 'pad' the dimension I out to the nearest multiple of the mesh size. So 8 would become 16. 8 of our chips hold 1 real row element, while the other 8 hold a dummy padded 0 row. The effective dimension I per device becomes 1 element.
+- Because we shard I along X and Y, we end up with I/16. Meaning, each shard gets 0.5 of an I row. One row is 2048 x 4096 bf16 values, so half a row is 8,388,608 bytes. 
+	- FYI: This goes into fractional sharding. Physically we cannot hold half of a row, so we 'pad' the dimension I out to the nearest multiple of the mesh size. JAX won't do this for us: `jax.device_put` raises an error when 8 rows are sharded 16 ways, so we'd pad I ourselves. So 8 would become 16. 8 of our chips hold 1 real row element, while the other 8 hold a dummy padded 0 row. The effective dimension I per device becomes 1 element.
 - $$
   \text{Elements per Device} = 1 \times 2048 \times 4096 = 8{,}388{,}608 \text{ elements}
   $$
