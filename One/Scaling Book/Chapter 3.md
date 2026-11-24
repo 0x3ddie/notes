@@ -201,123 +201,115 @@ The hardware configuration is `Mesh({'X': 2, 'Y': 8, 'Z': 4})`.
 - From now on I think we can speed through some calculations since we have all our bandwidth references included:
 - Global matrix size would be around 8,388,608 bytes (bfloat16). Since we shard 4 times across X and Y, local shard shapes would be [256, 1024]. Local shard size would therefore be 512kB.
 - Because our AllGather only moves across X, D remains sharded by 4, a single X ring of 4 chips would 2BD/Y, or 2.1MB.
-- Meaning, the AllGather over X never touches the $D_Y$ sharding. Each X ring of 4 chips just rebuilds its own Y slice, a `bf16[1024, 1024]` block of $2BD/Y = 2{,}097{,}152\text{ bytes}$, from 4 shards of 524,288 bytes. The 4 Y slices do this in parallel on their own rings.
-- A v4p $4 \times 4 \times 4$ is a full cube, so every axis has a wraparound and we get the bidirectional 9.0e10 bytes/s.
+- Meaning, the AllGather over X never touches the $D_Y$ sharding. Each X ring just rebuilds its own `bf16[1024, 1024]` block, $2BD/Y = 2{,}097{,}152\text{ bytes}$. A v4p $4 \times 4 \times 4$ has wraparounds on every axis, so we get the bidirectional 9.0e10 bytes/s.
 - **AllGather over X:**
 
   $$
   T_{\text{comms}} = \frac{2BD/Y}{W_{\text{ici}}} = \frac{2{,}097{,}152 \text{ bytes}}{9.0 \times 10^{10} \text{ bytes/s}} = \mathbf{23.3 \ \mu\text{s}}
   $$
 
-- Latency is only about 2μs (2 hops each way on a ring of 4), so we're bandwidth bound at around **23 microseconds**.
-- **AllGather over XY:** both subscripts come off, so every chip ends up with the full 8,388,608 bytes. 4 times the data, but gathering over two axes at once doubles our bandwidth.
+- Latency is only about 2μs, so we're bandwidth bound at around **23 microseconds**.
+- **AllGather over XY:** every chip ends up with the full 8,388,608 bytes. 4 times the data, but gathering over two axes doubles our bandwidth:
 
   $$
   T_{\text{comms}} = \frac{2BD}{2 \cdot W_{\text{ici}}} = \frac{8{,}388{,}608 \text{ bytes}}{2 \times 9.0 \times 10^{10} \text{ bytes/s}} = \mathbf{46.6 \ \mu\text{s}}
   $$
 
-- The longest path is $(4 + 4)/2 = 4$ hops, about 4μs, so still bandwidth bound. Exactly double part 1.
-- **AllReduce over Z:** the 4 chips along each Z ring hold different partial sums of the same local block. The sharding stays $[B_X, D_Y]$, so only the 524,288 byte `bf16[256, 1024]` shard goes around, and we pay for it twice (ReduceScatter plus AllGather).
+- **AllReduce over Z:** the sharding stays $[B_X, D_Y]$, so only the 524,288 byte shard goes around each Z ring, and we pay for it twice (ReduceScatter plus AllGather):
 
   $$
   T_{\text{comms}} = 2 \times \frac{2BD/(X \cdot Y)}{W_{\text{ici}}} = \frac{2 \times 524{,}288 \text{ bytes}}{9.0 \times 10^{10} \text{ bytes/s}} = \mathbf{11.65 \ \mu\text{s}}
   $$
 
-- So roughly 23μs, 47μs and 12μs. The AllReduce is supposed to be the expensive primitive, but it's the cheapest here because it only moves a 512kB shard. We pay for the bytes going around the ring, not the name of the primitive.
-- The solution adds a trick: all 4 Z planes hold the same copy, so if each plane just keeps its own quarter of the rows, we're at $[B_{XZ}, D_Y]$ for free and can gather over X and Z together (X, Y and Z for part 2). Part 1 drops to $2{,}097{,}152 / (2 \times 9.0 \times 10^{10}) = 11.65$μs and part 2 to $8{,}388{,}608 / (3 \times 9.0 \times 10^{10}) = 31$μs. The solution prints 11.5μs for part 1, which is just half of a rounded 23.
+- So the "expensive" AllReduce is the cheapest of the three, because it only moves a 512kB shard. We pay for the bytes going around the ring, not the name of the primitive.
 
 **Question 3 [latency-bound AllGather]:** Same TPU v4p $4 \times 4 \times 4$ slice and mesh `Mesh({'X': 4, 'Y': 4, 'Z': 4})` as Question 2, but now the array is tiny: $\text{AllGather}_X([B_X])$ with $B = 128$ in bfloat16. How long should it take? Hint: we're probably latency bound.
-- The whole array is $128 \times 2 = 256\text{ bytes}$, so each chip along X holds 64 bytes. Pushing that over a link at 4.5e10 bytes/s is about 1.4 nanoseconds, but every hop costs around 1μs no matter how little we send. Anything under $4.5 \times 10^{10} \times 10^{-6} = 45\text{ kB}$ per hop is latency bound, and we're about 700 times below that.
-- So we just count hops. X has 4 chips and a wraparound, so the farthest chip is 2 hops away.
+- The whole array is $128 \times 2 = 256\text{ bytes}$. Every hop costs around 1μs no matter how little we send, and anything under $4.5 \times 10^{10} \times 10^{-6} = 45\text{ kB}$ per hop is latency bound.
+- So we just count hops. X has 4 chips and a wraparound, so the farthest chip is 2 hops away:
 
   $$
   T_{\text{total}} = \max\left[\frac{T_{\text{min}} \cdot \lvert X \rvert}{2}, \frac{V}{W_{\text{ici}}}\right] = \max\left[\frac{1 \ \mu\text{s} \times 4}{2}, \frac{256 \text{ bytes}}{9.0 \times 10^{10} \text{ bytes/s}}\right] = \mathbf{2 \ \mu\text{s}}
   $$
 
-- Roughly **2 microseconds**, and the bandwidth term (about 3 nanoseconds) doesn't even register. Meaning, here the cost scales with ring size, not bytes: the same 256 bytes on a 16 chip ring would take 8μs.
+- Roughly **2 microseconds**. Meaning, here the cost scales with ring size, not bytes.
 
-**Question 4 [matmul strategies]:** For $X[B, D] \cdot_D Y[D_X, F] \to Z[B, F]$, Strategy 1 is the usual rule: $\text{AllGather}_X(Y[D_X, F])$, then one local matmul on fully replicated matrices (Case 2). Strategy 2 multiplies the shards where they sit, $X[B, D_X] \cdot_D Y[D_X, F] \to Z[B, F]\{U_X\}$ (Case 3), then runs $\text{AllReduce}_X(Z[B, F]\{U_X\})$. What does each cost in FLOPs and comms? Which is better and why?
-- Basically: send the weights around the ring once, or the output twice? Everything is bf16 (2 bytes per element), $C$ is one chip's FLOPs/s and $W_{\text{ici}}$ is the bidirectional ICI bandwidth.
-- **Strategy 1:** the AllGather moves all of $Y$, $2DF$ bytes, and then every chip does the whole $2BDF$ matmul. All the chips along X compute the same answer.
+**Question 4 [matmul strategies]:** For $X[B, D] \cdot_D Y[D_X, F] \to Z[B, F]$, Strategy 1 is the usual rule: $\text{AllGather}_X(Y[D_X, F])$, then one local matmul (Case 2). Strategy 2 multiplies the shards where they sit, $X[B, D_X] \cdot_D Y[D_X, F] \to Z[B, F]\{U_X\}$ (Case 3), then runs $\text{AllReduce}_X(Z[B, F]\{U_X\})$. What does each cost in FLOPs and comms? Which is better and why?
+- Basically: send the weights around the ring once, or the output twice? Everything is bf16, $C$ is one chip's FLOPs/s and $W_{\text{ici}}$ is the bidirectional ICI bandwidth.
+- **Strategy 1:** the AllGather moves all of $Y$ ($2DF$ bytes), then every chip does the whole $2BDF$ matmul:
 
   $$
   T_1 = \max\left(\frac{2BDF}{C}, \frac{2DF}{W_{\text{ici}}}\right)
   $$
 
-- **Strategy 2:** $X$ is replicated, so each chip just keeps the slice of $D$ that matches its shard of $Y$, for free. That's $2BDF/X$ FLOPs per chip, so the compute is actually sharded. But every chip ends up with a full sized $Z[B, F]$ of partial sums ($2BF$ bytes), and an AllReduce is twice an AllGather, so $4BF$ bytes worth.
+- **Strategy 2:** $X$ is replicated, so each chip just keeps the slice of $D$ that matches its shard of $Y$, for $2BDF/X$ FLOPs. But every chip ends up with a full $Z[B, F]$ of partial sums ($2BF$ bytes), and an AllReduce costs two AllGathers:
 
   $$
   T_2 = \max\left(\frac{2BDF}{X \cdot C}, \frac{4BF}{W_{\text{ici}}}\right)
   $$
 
-- **Which is better?** Strategy 2's math term is always the smaller one, so it wins when its comms term beats whichever term limits Strategy 1:
+- **Which is better?** Strategy 2's math term is always the smaller one, so it wins when its comms beat whichever term limits Strategy 1:
 
   $$
   \frac{4BF}{W_{\text{ici}}} < \max\left(\frac{2BDF}{C}, \frac{2DF}{W_{\text{ici}}}\right) \implies D > \frac{2C}{W_{\text{ici}}} \ \text{ or } \ D > 2B
   $$
 
-- For a TPU v5p, $C / W_{\text{ici}} = 4.59 \times 10^{14} / 1.8 \times 10^{11} = 2550$, so Strategy 2 wins when $D > 5100$ or $D > 2B$.
-- Napkin math with the Question 7 block ($D = 8192$, $F = 32768$, $B = 128$) on a v5p with $X = 4$: Strategy 1 gathers 537MB of weights, around 2.98 ms, for 150μs of math. Strategy 2 reduces an 8.4MB output (16.8MB worth of traffic), around 93μs, for 37μs of math. 32 times faster, which is just $D / (2B)$.
-- So for a big model and a small batch, Strategy 2 is better: the output $[B, F]$ is tiny next to the weights $[D, F]$, and we skip the duplicated FLOPs. We don't always do it because the setup is rare: usually the activations are sharded on the same mesh axis as the weights (more in Chapter 5), so $X$ isn't replicated for us to slice.
+- On a TPU v5p, $C / W_{\text{ici}} = 4.59 \times 10^{14} / 1.8 \times 10^{11} = 2550$, so Strategy 2 wins when $D > 5100$ or $D > 2B$. Meaning, Strategy 2 is for a big model and a small batch, where the output $[B, F]$ is tiny next to the weights $[D, F]$.
+- We don't always do it because the activations are usually sharded on the same mesh axis as the weights, so $X$ isn't replicated for us to slice.
 
 **Question 5 [minimum latency]:** We want the fastest possible matmul $A[I, J] \cdot_J B[J, K] \to C[I, K]$ on a TPU v4p $4 \times 4 \times 4$. We can shard the inputs any way we like, but $C$ has to end up fully replicated. Which input sharding gives the lowest latency, and what are the total FLOPs and the comms time?
-- We have 64 chips at $2.75 \times 10^{14}$ bf16 FLOPs/s each (call it $C_{\text{chip}}$, since $C$ is the output here), and three ICI axes at 9.0e10 bytes/s each. The output is $2IK$ bytes and every chip needs all of it, so we want to split the FLOPs 64 ways while paying the least to put $C$ back together.
-- The solution lists four options and leaves the math to us:
-    1. **Shard the rows:** $A[I_{XYZ}, J] \cdot B[J, K] \to C[I_{XYZ}, K]$. Case 1, no comms for the matmul, $2IJK/64$ FLOPs per chip. Then an $\text{AllGather}_{XYZ}$ of $C$: $2IK$ bytes over three axes, so $T_{\text{comms}} = 2IK / (3W_{\text{ici}})$.
-    2. **Shard the columns:** $A[I, J] \cdot B[J, K_{XYZ}] \to C[I, K_{XYZ}]$. Mirror image of option 1, same cost.
-    3. **Shard the contracting dimension:** $A[I, J_{XYZ}] \cdot B[J_{XYZ}, K] \to C[I, K]\{U_{XYZ}\}$. Same FLOPs, but now every chip holds a full sized partial sum and we need an AllReduce: $T_{\text{comms}} = 4IK / (3W_{\text{ici}})$, twice options 1 and 2.
+- We have 64 chips at $2.75 \times 10^{14}$ bf16 FLOPs/s ($C_{\text{chip}}$, since $C$ is the output) and three ICI axes at 9.0e10 bytes/s. Every chip needs the whole $2IK$ byte output, so we want to split the FLOPs 64 ways and pay the least to rebuild $C$. The solution lists four options:
+    1. **Shard the rows:** $A[I_{XYZ}, J] \cdot B[J, K] \to C[I_{XYZ}, K]$. Case 1, then an $\text{AllGather}_{XYZ}$ of $C$ over three axes: $T_{\text{comms}} = 2IK / (3W_{\text{ici}})$.
+    2. **Shard the columns:** $A[I, J] \cdot B[J, K_{XYZ}] \to C[I, K_{XYZ}]$. Mirror image, same cost.
+    3. **Shard the contracting dimension:** $A[I, J_{XYZ}] \cdot B[J_{XYZ}, K] \to C[I, K]\{U_{XYZ}\}$. Needs an AllReduce, so twice the comms.
     4. **Don't shard at all:** zero comms, but each chip does all $2IJK$ FLOPs.
-- Option 3 is never better than 1 or 2. Sharding vs not sharding comes down to the AllGather against the full matmul:
+- Option 3 never wins, so it comes down to the AllGather against the full matmul:
 
   $$
   \frac{2IK}{3 \cdot W_{\text{ici}}} < \frac{2IJK}{C_{\text{chip}}} \implies J > \frac{C_{\text{chip}}}{3 \cdot W_{\text{ici}}} = \frac{2.75 \times 10^{14}}{2.7 \times 10^{11}} \approx \mathbf{1019}
   $$
 
-- That assumes the matmul overlaps with the gather (the lower bound from Chapter 1). Back to back, it's $J > 1035$.
-- So for any normal sized matrix: shard one of the non-contracting dimensions over all three axes, $A[I_{XYZ}, J]$ with $B$ replicated or $A$ replicated with $B[J, K_{XYZ}]$, and leave $J$ alone. Both are equally good. Total FLOPs are $2IJK$ ($2IJK/64$ per chip), and the comms time is
+- So for any normal sized matrix, we shard one of the non-contracting dimensions over all three axes, $A[I_{XYZ}, J]$ or $B[J, K_{XYZ}]$, and leave $J$ alone. Total FLOPs are $2IJK$ ($2IJK/64$ per chip), and the comms time is
 
   $$
   T_{\text{comms}} = \frac{2IK \text{ bytes}}{3 \times 9.0 \times 10^{10} \text{ bytes/s}} = \frac{2IK}{2.7 \times 10^{11}} \text{ seconds}
   $$
 
-- There's a latency floor of about 6μs (the longest path through the cube is $(4 + 4 + 4)/2 = 6$ hops), which only matters when the output is under about 1.6MB. And below a $J$ of about a thousand, option 4 wins: it's faster to never talk, even though that burns 64 times the FLOPs.
+- Below a $J$ of about a thousand, it's faster to not shard at all.
 
-**Question 6 [comms vs compute]:** We run $A[I_X, J_Y] \cdot_J B[J_Y, K] \to C[I_X, K]$ on a TPU v5e $4 \times 4$. What communication does it need, and how does the comms time compare to the compute time? Same two questions for $A[I_X, J] \cdot_J B[J_X, K_Y] \to C[I_X, K_Y]$ (the standard training setting: data, tensor and ZeRO sharding combined) and for $A[I_X, J] \cdot_J B[J, K_Y] \to C[I_X, K_Y]$ (the standard inference setting: pure tensor parallelism plus data).
-- There's no published solution or sizes for this one, so we keep $I$, $J$, $K$ as symbols and assume bf16. Basically "which of the 4 cases is it?" three times.
-- A v5e chip does $1.97 \times 10^{14}$ FLOPs/s and each ICI link carries 4.5e10 bytes/s one way. Same catch as Pop Quiz 2: a $4 \times 4$ v5e slice has no wraparounds, so data at one edge needs 3 hops to reach the other. Gathering $V$ bytes over an axis of 4 takes $\frac{3}{4} V / (4.5 \times 10^{10})$, same as $V / (6.0 \times 10^{10})$.
-- In all three, each chip multiplies 1/16 of the problem, $IJK/8$ FLOPs. So $T_{\text{math}} = IJK / (8 \times 1.97 \times 10^{14})$ every time, and only the comms change.
+**Question 6 [comms vs compute]:** We run $A[I_X, J_Y] \cdot_J B[J_Y, K] \to C[I_X, K]$ on a TPU v5e $4 \times 4$. What communication does it need, and how does the comms time compare to the compute time? Same for $A[I_X, J] \cdot_J B[J_X, K_Y] \to C[I_X, K_Y]$ (the standard training setting) and $A[I_X, J] \cdot_J B[J, K_Y] \to C[I_X, K_Y]$ (the standard inference setting).
+- No sizes are given, so we keep $I$, $J$, $K$ as symbols in bf16. Basically "which of the 4 cases is it?" three times.
+- A v5e does $1.97 \times 10^{14}$ FLOPs/s with 4.5e10 bytes/s per ICI link one way. Same catch as Pop Quiz 2: a $4 \times 4$ v5e has no wraparounds, so gathering $V$ bytes over an axis of 4 takes $\frac{3}{4} V / (4.5 \times 10^{10})$, same as $V / (6.0 \times 10^{10})$.
+- Each chip always multiplies 1/16 of the problem, so $T_{\text{math}} = IJK / (8 \times 1.97 \times 10^{14})$ in all three. Only the comms change.
 - **First:** $A[I_X, J_Y] \cdot_J B[J_Y, K] \to C[I_X, K]$
-    - $J$ is sharded on Y in both inputs, so this is Case 3: multiply locally to get $C[I_X, K]\{U_Y\}$, then $\text{AllReduce}_Y$. Each line of 4 chips along Y reduces an $[I/4, K]$ block, $IK/2$ bytes, in two passes:
+    - $J$ is sharded on Y in both inputs, so Case 3: multiply locally, then $\text{AllReduce}_Y$ an $[I/4, K]$ block ($IK/2$ bytes) in two passes:
 
       $$
       T_{\text{comms}} = \frac{2 \times IK/2}{6.0 \times 10^{10}} = \frac{IK}{6.0 \times 10^{10}} \text{ s} \qquad \frac{T_{\text{comms}}}{T_{\text{math}}} = \frac{8 \times 1.97 \times 10^{14}}{6.0 \times 10^{10} \cdot J} \approx \frac{26{,}267}{J}
       $$
 
-    - So we're comms bound unless $J > 26{,}267$. With $J = 8192$ the AllReduce takes about 3.2 times as long as the math.
+    - So we're comms bound unless $J > 26{,}267$.
 - **Second (training):** $A[I_X, J] \cdot_J B[J_X, K_Y] \to C[I_X, K_Y]$
-    - Only $B$ has a sharded contracting dimension (Case 2), on X. So we run $\text{AllGather}_X(B[J_X, K_Y]) \to B[J, K_Y]$, where each line along X gathers a $[J, K/4]$ block of weights ($JK/2$ bytes), and then multiply locally:
+    - Only $B$ has a sharded contracting dimension (Case 2), so we $\text{AllGather}_X$ each $[J, K/4]$ block of weights ($JK/2$ bytes), then multiply locally:
 
       $$
       T_{\text{comms}} = \frac{JK/2}{6.0 \times 10^{10}} = \frac{JK}{1.2 \times 10^{11}} \text{ s} \qquad \frac{T_{\text{comms}}}{T_{\text{math}}} = \frac{8 \times 1.97 \times 10^{14}}{1.2 \times 10^{11} \cdot I} \approx \frac{13{,}133}{I}
       $$
 
-    - The comms don't depend on the batch but the math does, so here the batch has to be big. We're compute bound once $I > 13{,}133$. With $I = 1024$ we'd spend about 12.8 times longer gathering weights than multiplying.
+    - The comms don't depend on the batch but the math does, so we're compute bound once $I > 13{,}133$.
 - **Third (inference):** $A[I_X, J] \cdot_J B[J, K_Y] \to C[I_X, K_Y]$
-    - Nobody has $J$ sharded, and the two sharded dimensions sit on different mesh axes, so this is Case 1: $T_{\text{comms}} = 0$, all math.
-- Meaning, same FLOPs per chip in all three. The inference layout is free, the training layout pays to move weights (so it wants a big batch), and the first one pays to move outputs (so it wants a big $J$).
+    - Nobody has $J$ sharded, so Case 1: $T_{\text{comms}} = 0$, all math.
+- Meaning, the inference layout is free, the training layout pays to move weights (so it wants a big batch), and the first one pays to move outputs (so it wants a big $J$).
 
-**Question 7 [sharding a transformer block]:** A Transformer MLP block is $In[B, D] \cdot W_{\text{in}}[D, F] \cdot W_{\text{out}}[F, D]$ with $F \gg D$. With $D = 8192$, $F = 32768$, $B = 128$, all bfloat16, on a TPU v5e $2 \times 2$ slice where we pretend each TPU only has 300MB of memory free, how should we shard $In$, $W_{\text{in}}$, $W_{\text{out}}$ and $Out$ so everything fits and runs as fast as possible? How does the time split between comms and FLOPs? Hint: $Out$ doesn't have to be fully replicated, but it needs the same sharding as $In$ so the layer can be stacked.
-- **Memory first.** Each weight matrix is $2 \times 8192 \times 32768 = 536{,}870{,}912\text{ bytes}$, about 537MB. The activations are $2 \times 128 \times 8192 = 2{,}097{,}152\text{ bytes}$, about 2.1MB, which is nothing.
-- Together the weights are 1,074MB, and the 4 chips have 1,200MB. No room to replicate anything, so both matrices get split 4 ways over X and Y: $2 \times 134\text{ MB} = 268\text{ MB}$ per chip, with about 32MB left over. The only real choice is which dimension we cut:
-    1. $In[B_X, D] \cdot W_{\text{in}}[D_{XY}, F] \cdot W_{\text{out}}[F, D_{XY}] \to Out[B_X, D]$, cutting $D$. This is FSDP (fully sharded data parallelism): the batch and the weights are both sharded, and the weights get AllGathered right before each matmul.
-    2. $In[B, D_{XY}] \cdot W_{\text{in}}[D, F_{XY}] \cdot W_{\text{out}}[F_{XY}, D] \to Out[B, D_{XY}]$, cutting $F$. This is tensor parallelism. Chapter 5 covers both properly.
-- **FSDP loses here.** Gathering $W_{\text{in}}$ means 537MB landing on a chip with 32MB to spare, so it doesn't even fit. And if it did, each gather takes around 4.5 ms, so about 8.9 ms of comms for the two matrices.
-- **Tensor parallelism.** The big matrices never move, only the 2.1MB activations do:
+**Question 7 [sharding a transformer block]:** A Transformer MLP block is $In[B, D] \cdot W_{\text{in}}[D, F] \cdot W_{\text{out}}[F, D]$ with $F \gg D$, $D = 8192$, $F = 32768$ and $B = 128$, all bfloat16, on a TPU v5e $2 \times 2$ where we pretend each TPU only has 300MB free. How should we shard $In$, $W_{\text{in}}$, $W_{\text{out}}$ and $Out$ to fit and run as fast as possible, and how does the time split between comms and FLOPs? Hint: $Out$ needs the same sharding as $In$ so layers can stack.
+- **Memory first.** Each weight matrix is $2 \times 8192 \times 32768 = 536{,}870{,}912\text{ bytes}$, about 537MB. Together that's 1,074MB against 1,200MB across the 4 chips, so both get split 4 ways over X and Y: $2 \times 134\text{ MB} = 268\text{ MB}$ per chip, with about 32MB left over. The activations, $2 \times 128 \times 8192 = 2{,}097{,}152\text{ bytes}$ (2.1MB), are nothing. The only real choice is which dimension we cut:
+    1. $In[B_X, D] \cdot W_{\text{in}}[D_{XY}, F] \cdot W_{\text{out}}[F, D_{XY}] \to Out[B_X, D]$, cutting $D$. This is FSDP (fully sharded data parallelism), which AllGathers the weights right before each matmul. But 537MB doesn't fit in 32MB of spare room, and the two gathers would cost about 8.9 ms anyway.
+    2. $In[B, D_{XY}] \cdot W_{\text{in}}[D, F_{XY}] \cdot W_{\text{out}}[F_{XY}, D] \to Out[B, D_{XY}]$, cutting $F$. This is tensor parallelism, and only the 2.1MB activations ever move.
+- **Tensor parallelism, step by step:**
     1. $\text{AllGather}_{XY}(In[B, D_{XY}]) \to In[B, D]$
     2. $In[B, D] \cdot W_{\text{in}}[D, F_{XY}] \to H[B, F_{XY}]$. Case 1, no comms.
     3. $H[B, F_{XY}] \cdot W_{\text{out}}[F_{XY}, D] \to Out[B, D]\{U_{XY}\}$. Case 3, multiplied locally.
-    4. $\text{ReduceScatter}_{XY}(Out[B, D]\{U_{XY}\}) \to Out[B, D_{XY}]$. This lands us back on the input's sharding, and a ReduceScatter is half the price of an AllReduce. That's what the hint is for.
-- Peak memory per chip is the 268MB of weights plus three small activation arrays, about 275MB. Under the limit.
+    4. $\text{ReduceScatter}_{XY}(Out[B, D]\{U_{XY}\}) \to Out[B, D_{XY}]$. This lands us back on the input's sharding (that's what the hint is for), at half the price of an AllReduce.
+- Peak memory is about 275MB per chip, under the limit.
 - **FLOPs.** Each chip does two matmuls of $2 \cdot B \cdot D \cdot F/4$:
 
   $$
@@ -328,36 +320,26 @@ The hardware configuration is `Mesh({'X': 2, 'Y': 8, 'Z': 4})`.
   T_{\text{math}} = \frac{3.44 \times 10^{10} \text{ FLOPs}}{1.97 \times 10^{14} \text{ FLOPs/s}} = \mathbf{174 \ \mu\text{s}}
   $$
 
-- No duplicated work: $4BDF \approx 1.37 \times 10^{11}$ FLOPs in total, same as unsharded.
-- **Comms.** A v5e $2 \times 2$ has no wraparounds, so each chip has just 2 ICI links (one per axis) at 4.5e10 bytes/s each way. In the AllGather every chip pulls in the other three shards, 3/4 of the 2.1MB:
+- **Comms.** A v5e $2 \times 2$ has no wraparounds, so each chip has just 2 ICI links (one per axis) at 4.5e10 bytes/s each way. In the AllGather every chip pulls in the other three shards, 3/4 of the 2.1MB, and the ReduceScatter moves the same volume back:
 
   $$
   T_{\text{AllGather}} = \frac{\frac{3}{4} \times 2{,}097{,}152 \text{ bytes}}{2 \times 4.5 \times 10^{10} \text{ bytes/s}} = \mathbf{17.5 \ \mu\text{s}}
   $$
 
-- The ReduceScatter moves the same volume back:
-
   $$
   T_{\text{comms}} = 2 \times 17.5 \ \mu\text{s} \approx \mathbf{35 \ \mu\text{s}}
   $$
 
-- (The multi-axis formula from Question 2 would say 23μs, but it assumes two links into every chip per axis, and a $2 \times 2$ only has one.)
-- So the block spends roughly **174μs on FLOPs and 35μs on comms**. The math dominates: around 174μs if the comms overlap with the matmuls, 209μs if they run back to back. Compared to FSDP we move $F / B = 256$ times fewer bytes.
-- The idea to keep: put the communication on the $[B, D]$ arrays and never on anything with an $F$ in it.
-- FYI, at $B = 128$ the real bottleneck is HBM: 128 FLOPs/byte is under the v5e's 240 from Chapter 1, and streaming each chip's 268MB of weights takes around 327μs at 8.2e11 bytes/s.
+- So the block spends roughly **174μs on FLOPs and 35μs on comms**. The idea to keep: put the communication on the $[B, D]$ arrays and never on anything with an $F$ in it.
 
 **Question 8 [challenge]:** Using the JAX snippet from the notes, put a sharded array on the mesh and time each of the 4 communication primitives (AllGather, AllReduce, ReduceScatter, AllToAll) with pmap or shard_map, using `jax.lax.all_gather`, `jax.lax.psum`, `jax.lax.psum_scatter` and `jax.lax.all_to_all`. What exactly does each one do, and how long does it take?
-- **Semantics.** Inside `shard_map` we only see one device's local block, and each function is one of our primitives acting on that block along a named mesh axis. With 4 chips on X and a global $[E, F]$ array:
-
-| Primitive | Call inside `shard_map` | Local block in | Local block out |
-|---|---|---|---|
-| AllGather | `all_gather(x, 'X', axis=0, tiled=True)` | $[E/4, F]$ | $[E, F]$ |
-| AllReduce | `psum(x, 'X')` | $[E, F]$ | $[E, F]$ |
-| ReduceScatter | `psum_scatter(x, 'X', scatter_dimension=0, tiled=True)` | $[E, F]$ | $[E/4, F]$ |
-| AllToAll | `all_to_all(x, 'X', split_axis=1, concat_axis=0, tiled=True)` | $[E/4, F]$ | $[E, F/4]$ |
-
-- `tiled=True` makes these match our notation by concatenating (or splitting) along an existing axis. Without it, `all_gather` stacks the shards on a new leading axis. For `psum` and `psum_scatter`, every device starts with its own full sized block of partial sums (our $\{U_X\}$).
-- **Code.** Same array as Pop Quiz 2, `bf16[2048, 8192]`, so we already have a number for the AllGather:
+- **Semantics.** Inside `shard_map` we only see one device's local block. With 4 chips on X and a global $[E, F]$ array, it goes:
+    - AllGather (`all_gather`): $[E/4, F] \to [E, F]$
+    - AllReduce (`psum`): $[E, F] \to [E, F]$, summed
+    - ReduceScatter (`psum_scatter`): $[E, F] \to [E/4, F]$
+    - AllToAll (`all_to_all`): $[E/4, F] \to [E, F/4]$
+- `tiled=True` concatenates (or splits) along an existing axis, which matches our notation. For `psum` and `psum_scatter`, every device starts with its own full block of partial sums (our $\{U_X\}$).
+- **Code.** Same `bf16[2048, 8192]` array as Pop Quiz 2:
 
 ```python
 import time
@@ -412,71 +394,61 @@ bench('ReduceScatter', reduce_scatter, unreduced)
 bench('AllToAll', all_to_all, sharded)
 ```
 
-- **What theory predicts.** $V = 2 \times 2048 \times 8192 = 33{,}554{,}432\text{ bytes}$ in every case: the whole global array for the AllGather and the AllToAll, and the full sized block of partial sums for the two reductions. On a TPU v5e $4 \times 2$ (8 chips, 4.5e10 bytes/s per link one way), the X axis has 4 chips and no wraparound:
+- **Predictions.** $V = 2 \times 2048 \times 8192 = 33{,}554{,}432\text{ bytes}$ in every case. On a TPU v5e $4 \times 2$ the X axis has 4 chips and no wraparound, so like Pop Quiz 2 the edge link carries 3 of the 4 shards and a gather takes $\frac{3}{4} V / (4.5 \times 10^{10})$:
+    - AllGather: around 559μs
+    - ReduceScatter: same as the AllGather, around 559μs
+    - AllReduce: two AllGathers, around 1,118μs
+    - AllToAll: the middle link carries 4 of the 16 blocks each way, $\frac{1}{4} V / (4.5 \times 10^{10})$, so around 186μs. A third of the AllGather instead of a quarter, since there's no wraparound.
+- All well above the 3μs latency floor, so bandwidth bound.
+- This question needs a TPU, so I'll come back to it.
 
-| Primitive | Cost | Full ring ($W_{\text{ici}}$ = 9.0e10) | Axis of 4, no wraparound |
-|---|---|---|---|
-| AllGather | $V / W_{\text{ici}}$ | 373μs | 559μs |
-| ReduceScatter | same as AllGather | 373μs | 559μs |
-| AllReduce | 2 AllGathers | 746μs | 1,118μs |
-| AllToAll | AllGather / 4 on a ring | 93μs | 186μs |
-
-- The last column is what we should actually see. Pop Quiz 2 counting again: the edge link carries 3 of the 4 shards, so the gather takes $\frac{3}{4} V / (4.5 \times 10^{10})$. For the AllToAll, the middle link carries 4 of the 16 blocks each way, $\frac{1}{4} V / (4.5 \times 10^{10})$, so a third of the AllGather instead of a quarter. The latency floor is about 3μs, so all four are bandwidth bound.
-- For reference, the published profile of the Pop Quiz 2 AllGather shows 680μs against our 560μs, roughly 20% over (and wall clock per call adds dispatch overhead on top).
-- **TODO(eddie):** run this on a real TPU runtime (for example a Colab TPU runtime; the code has only been checked for shapes on CPU with 8 fake devices) and paste the observed time for each primitive next to the predictions. If the runtime isn't a v5e $4 \times 2$, redo the table with that chip's ICI bandwidth first.
-
-**Question 9 [another strategy for sharded matmuls?]:** When only one input has its contracting dimension sharded, the rule so far was to AllGather that input and contract locally. The other idea is to treat it like Case 3: for $A[I, J_X] \cdot_J B[J, K] \to C[I, K]$, (1) $C[I, K]\{U_X\} = A[I, J_X] \cdot B[J_X, K]$, then (2) $C[I, K] = \text{AllReduce}(C[I, K]\{U_X\})$.
+**Question 9 [another strategy for sharded matmuls?]:** When only one input has its contracting dimension sharded, we've been AllGathering it and contracting locally. The other option is to treat it like Case 3: for $A[I, J_X] \cdot_J B[J, K] \to C[I, K]$, (1) $C[I, K]\{U_X\} = A[I, J_X] \cdot B[J_X, K]$, then (2) $C[I, K] = \text{AllReduce}(C[I, K]\{U_X\})$.
 - This is Strategy 2 from Question 4 again, just with indices.
 - **1. Spell out what each device computes for $A[N, M]$ and $B[M, K]$, with $A$ sharded as $A[I, J_X]$ over $P$ devices and the output replicated on all of them.**
-    - Device $p$ (for $p = 0, \dots, P - 1$) holds the columns of $A$ in its range $J_p = \{pM/P, \dots, (p+1)M/P - 1\}$, an $[N, M/P]$ block. $B$ is replicated, so it just keeps the matching rows $J_p$, an $[M/P, K]$ block.
-    - Each device multiplies its two blocks. For every $n$ and $k$:
+    - Device $p$ holds the columns $J_p = \{pM/P, \dots, (p+1)M/P - 1\}$ of $A$, an $[N, M/P]$ block, and keeps the matching rows of the replicated $B$. Multiplying gives a full $[N, K]$ matrix where each entry only has this device's $M/P$ terms ($2NMK/P$ FLOPs):
 
       $$
       C^{(p)}_{nk} = \sum_{m \in J_p} A_{nm} B_{mk}
       $$
 
-    - That's a full $[N, K]$ matrix on every device, but each entry only has the $M/P$ terms this device owns, for $2NMK/P$ FLOPs per device.
-    - Then the AllReduce adds the $P$ partial matrices and leaves the total on every device:
+    - The AllReduce then sums the $P$ partials onto every device:
 
       $$
       C_{nk} = \sum_{p=0}^{P-1} C^{(p)}_{nk}
       $$
 
 - **2. What changes if the result can stay sharded (over $N$ or $K$) instead of replicated?**
-    - Step 1 is the same. Step 2 becomes a ReduceScatter, $C[N, K]\{U_X\} \to C[N_X, K]$ or $C[N, K_X]$, so device $p$ only keeps the finished sum for its own $N/P$ rows (or $K/P$ columns). Half the comms, since we skip the AllGather at the end.
+    - Step 2 becomes a ReduceScatter to $C[N_X, K]$ or $C[N, K_X]$, so each device only keeps the finished sum for its own slice. Half the comms.
 - **3. On comms alone, how does the part 2 version compare with gathering $A$ first and then multiplying?**
-    - Both are one pass around the ring, and when we're throughput bound a pass costs the size of the full array. The AllGather moves $A$ ($NM$ elements), the ReduceScatter moves $C$ ($NK$ elements):
+    - Both are one pass around the ring, which costs the size of the full array when we're throughput bound. The AllGather moves $A$ ($NM$ elements), the ReduceScatter moves $C$ ($NK$ elements):
 
       $$
       \frac{T_{\text{AllGather } A}}{T_{\text{ReduceScatter } C}} = \frac{2NM / W_{\text{ici}}}{2NK / W_{\text{ici}}} = \mathbf{\frac{M}{K}}
       $$
 
-    - So multiplying first wins whenever the output dimension $K$ is smaller than the contracting dimension $M$. If we need the replicated output (part 1), the AllReduce doubles the cost and the break-even moves to $K < M/2$, the same $D > 2B$ from Question 4.
+    - So multiplying first wins whenever $K$ is smaller than $M$. If we need the replicated output, the AllReduce doubles the cost and the break-even moves to $K < M/2$, the same $D > 2B$ from Question 4.
 
 **Question 10 [fun with AllToAll]:** From the notes, an AllToAll takes a quarter of the time of an AllGather or ReduceScatter (when we're throughput bound). Where does that factor of 4 come from, and how would it change if ICI links only went in one direction?
 - **1. One direction first. $D$ devices in a ring do an AllGather or a ReduceScatter on an $N \times N$ matrix $A[I_X, J]$ (say $D$ divides $N$). Describe the comms and count the scalars that cross a single ICI link.**
-    - Each device holds a strip of $N/D$ rows, $N^2/D$ scalars. In the AllGather every device passes its strip to its neighbor, then keeps forwarding whatever it just received, for $D - 1$ steps.
-    - The ReduceScatter is the same loop with sums: at every step a device adds its contribution to the strip passing through and sends it on, and after $D - 1$ steps each strip lands, fully summed, on the device that keeps it.
-    - Either way, one strip crosses each link at each of the $D - 1$ steps:
+    - Each device holds a strip of $N/D$ rows ($N^2/D$ scalars). In the AllGather it passes its strip to its neighbor, then forwards whatever it just received, for $D - 1$ steps. The ReduceScatter is the same loop, adding as it goes. One strip crosses each link per step:
 
       $$
       (D - 1) \times \frac{N^2}{D} = \mathbf{N^2 \left(1 - \frac{1}{D}\right)} \approx N^2 \text{ scalars per link}
       $$
 
 - **2. Now an AllToAll, still one direction. How is the algorithm different, and how many scalars cross a single link?**
-    - An AllToAll $A[I_X, J] \to A[I, J_X]$ doesn't replicate anything, it just moves data to a new home. Each device cuts its strip into $D$ blocks of $N/D \times N/D$, one per destination. One stays put, and the block for the device $d$ hops away rides $d$ links and stops.
-    - So the load shrinks as it travels: $D - 1$ blocks on the first link, then $D - 2$, down to 1. With 4 devices that's $3 + 2 + 1 = 6$ blocks over each link, where the AllGather sent 3 full strips, or 12 blocks.
+    - An AllToAll doesn't replicate anything, it just moves data to a new home. Each device cuts its strip into $D$ blocks, one per destination, and each block rides only as far as its destination. So the load shrinks: $D - 1$ blocks on the first link, then $D - 2$, down to 1. With 4 devices that's $3 + 2 + 1 = 6$ blocks per link, where the AllGather sent 12:
 
       $$
       \frac{N^2}{D^2} \times \frac{D(D - 1)}{2} = \mathbf{\frac{N^2}{2} \left(1 - \frac{1}{D}\right)} \approx \frac{N^2}{2} \text{ scalars per link}
       $$
 
 - **3. Why is the ratio between parts 1 and 2 such a nice number?**
-    - It's exactly 2. An AllGather strip stays full size ($D$ blocks) for all $D - 1$ hops, so $D(D - 1)$ block-hops. An AllToAll strip drops a block at every stop, so $(D - 1) + (D - 2) + \dots + 1 = D(D - 1)/2$. A triangle instead of a rectangle: the average block only rides halfway around the ring.
+    - It's exactly 2. An AllGather strip stays full size for all $D - 1$ hops, while an AllToAll strip drops a block at every stop. A triangle instead of a rectangle.
 - **4. With bidirectional links, how does the AllGather time change?**
-    - Every strip can go both ways, so each direction of a link carries $(D - 1)/2$ strips instead of $D - 1$. Half the load per link, so half the time. A 2x win.
+    - Every strip can go both ways, so each direction of a link carries half the load. A 2x win.
 - **5. And the AllToAll time?**
-    - A 4x win, because two things get halved at once. Only about half the blocks go in each direction, and the farthest any of them travels is $D/2$ hops instead of $D - 1$. One direction of a link now carries $1 + 2 + \dots + D/2$, roughly $D^2/8$ blocks, against $D(D - 1)/2 \approx D^2/2$ before. That's $N^2/8$ scalars per link direction.
+    - A 4x win, because two things get halved: only about half the blocks go each way, and the farthest any of them travels is $D/2$ hops instead of $D - 1$. That's $N^2/8$ scalars per link direction.
 - **6. So what explains the ratio between AllGather and AllToAll time on a bidirectional ring?**
-    - Two separate factors of 2. Even with one way links, an AllGather copies each strip to every device, while an AllToAll delivers each block to exactly one device, on average half a ring away. Then the return direction gives the AllGather twice the links (2x), but gives the AllToAll twice the links and half the distance (4x). So $2 \times \frac{4}{2} = 4$.
-    - Counted exactly it's $4(1 - 1/D)$: 3 for a ring of 4, 3.75 for a ring of 16, and 4 in the limit. So "a quarter" is the big ring answer, and small axes get a bit less.
+    - Two factors of 2. An AllGather copies each strip to every device, while an AllToAll sends each block to one device, on average half a ring away. Then bidirectional links give the AllGather 2x and the AllToAll 4x, so $2 \times \frac{4}{2} = 4$.
+    - Counted exactly, it's $4(1 - 1/D)$: 3 for a ring of 4, and 4 in the limit.
