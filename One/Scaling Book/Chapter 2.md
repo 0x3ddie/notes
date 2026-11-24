@@ -30,7 +30,7 @@ Our goal is to shoot towards being compute-bound instead of memory-bound; this i
 
 ## On VMEM
 
-VMEM is typically the solution to being memory-bound. It’s lightning fast compared to HBM (around $22\times$ faster, although with a capacity in the MB), while HBM has massive capacity. So we have an imbalance here:
+VMEM is typically the solution to being memory-bound. It’s lightning fast compared to HBM (around $22\times$ faster on a v5e, or about $7\times$ on the newer TPU7x, although with a capacity in the MB), while HBM has massive capacity. So we have an imbalance here:
 
 - The MXU basically instantly finishes our math; to keep our MXU running at 100% efficiency, we need a high arithmetic intensity of around **240** when pulling data from HBM.
     
@@ -46,7 +46,7 @@ To summarize the system:
 - Reading from the **VMEM** provides a perfect, constant feed of data, requiring an intensity of only 10-20, causing our system to be compute-bound instead.
     
 
-If we can engineer our algorithm so that our working data fits perfectly within the VMEM, it is almost a given that we’ll avoid traditional memory-bound issues and default to compute-bound. However, because the cache is so small (few MBs), this is often very challenging.
+If we can engineer our algorithm so that our working data fits perfectly within the VMEM, it is almost a given that we’ll avoid traditional memory-bound issues and default to compute-bound. However, because the cache is so small (128 MiB on a v5e), this is often very challenging.
 
 ## On Chip Layouts
 
@@ -86,13 +86,17 @@ These pods are made up of $4 \times 4 \times 4$ cubes (in racks) that are connec
     
 ### The Speed Hierarchy
 
-$$\begin{array}{rll} \textbf{VMEM:} & \text{On silicon itself, right next to MXU} & (22\times \text{ HBM}) \\ \textbf{HBM:} & \text{High Bandwidth Memory: Same package, different silicon} & (2.8 \text{ TB/s}) \\ \textbf{ICI:} & \text{Inter-Core Connect, cross-chip networking in grid topology} & (90 \text{ GB/s per axis}) \\ \textbf{PCIe:} & \text{Motherboard connecting GPU/TPU nodes to the CPU} & \\ \textbf{DCN:} & \text{Data Center Network, global network} & (6.25 \text{ GB/s - Ultimate bottleneck}) \end{array}$$
+$$
+\begin{array}{rll} \textbf{VMEM:} & \text{On silicon itself, right next to MXU} & (22\times \text{ HBM}) \\ \textbf{HBM:} & \text{High Bandwidth Memory: Same package, different silicon} & (2.8 \text{ TB/s}) \\ \textbf{ICI:} & \text{Inter-Core Connect, cross-chip networking in grid topology} & (90 \text{ GB/s per axis}) \\ \textbf{PCIe:} & \text{Motherboard connecting GPU/TPU nodes to the CPU} & \\ \textbf{DCN:} & \text{Data Center Network, global network} & (6.25 \text{ GB/s - Ultimate bottleneck}) \end{array}
+$$
 
 For massive scale AI, DCN is a huge bottleneck we face. If our workload is so heavy that we exhaust a single slice (a single continuous ICI grid), we have to connect multiple slices together.
 
 Getting a matrix from a TPU in Slice A to a TPU in Slice B is lengthy:
 
-$$\text{Read from HBM} \to \text{PCIe} \to \text{CPU A} \to \text{Slice A NIC} \to \text{DCN} \to \text{Slice B NIC} \to \text{PCIe} \to \text{TPU B HBM}$$
+$$
+\text{Read from HBM} \to \text{PCIe} \to \text{CPU A} \to \text{Slice A NIC} \to \text{DCN} \to \text{Slice B NIC} \to \text{PCIe} \to \text{TPU B HBM}
+$$
 
 This throttles throughput from $2.8 \text{ TB/s}$ to $6.25 \text{ GB/s}$, a drop of several orders of magnitude.
 
@@ -114,9 +118,13 @@ With a 200B parameter model, and each parameter/element is 2 bytes, then our mat
 
 Splitting across 32 TPUs = performing 32 loading/math operations in parallel. Using the v4p HBM Bandwidth per chip, which is $1.2 \times 10^{12}$, we can simply take 400gb/32TPUs to get the GB processed per TPU, and then simply divide those GB by the bandwidth of the chip to find how long it would take for each TPU (or all 32 TPUs) to process the entire weight matrix.
 
-$$\text{Workload per chip} = \frac{400 \times 10^9 \text{ bytes}}{32 \text{ chips}} = \mathbf{12.5 \times 10^9 \text{ bytes per chip}}$$
+$$
+\text{Workload per chip} = \frac{400 \times 10^9 \text{ bytes}}{32 \text{ chips}} = \mathbf{12.5 \times 10^9 \text{ bytes per chip}}
+$$
 
-$$\text{Time to load} = \frac{12.5 \times 10^9 \text{ bytes}}{1.2 \times 10^{12} \text{ bytes/s}} = \mathbf{0.01042 \text{ seconds}}$$
+$$
+\text{Time to load} = \frac{12.5 \times 10^9 \text{ bytes}}{1.2 \times 10^{12} \text{ bytes/s}} = \mathbf{0.01042 \text{ seconds}}
+$$
 
 It takes us **10.42 milliseconds** to load all parameters from HBM into our systolic array.
 
@@ -128,9 +136,13 @@ With a 1.2T parameter model, and each parameter/element is 4 bytes, then our mat
 
 Splitting across 256 chips = performing 256 loading/math operations in parallel. Using the next-gen chip HBM Bandwidth per chip, which is $4.8 \times 10^{12}$, we can simply take 4.8T bytes/256 chips to get the GB processed per chip, and then simply divide those GB by the bandwidth of the chip to find how long it would take for each chip (or all 256 chips) to process the entire weight matrix.
 
-$$\text{Workload per chip} = \frac{4.8 \times 10^{12} \text{ bytes}}{256 \text{ chips}} = \mathbf{1.875 \times 10^{10} \text{ bytes per chip}}$$
+$$
+\text{Workload per chip} = \frac{4.8 \times 10^{12} \text{ bytes}}{256 \text{ chips}} = \mathbf{1.875 \times 10^{10} \text{ bytes per chip}}
+$$
 
-$$\text{Time to load} = \frac{1.875 \times 10^{10} \text{ bytes}}{4.8 \times 10^{12} \text{ bytes/s}} = \mathbf{0.00390625 \text{ seconds}}$$
+$$
+\text{Time to load} = \frac{1.875 \times 10^{10} \text{ bytes}}{4.8 \times 10^{12} \text{ bytes/s}} = \mathbf{0.00390625 \text{ seconds}}
+$$
 
 It takes us **3.91 milliseconds** to load all parameters from HBM into our pipelines.
 
@@ -147,9 +159,13 @@ With a 70B parameter model, and each parameter/element is 0.5 bytes, then our ma
 
 Splitting across 8 cores = performing 8 loading/math operations in parallel. Using the edge HBM Bandwidth per core, which is $4.5 \times 10^{11}$, we can simply take 35B bytes/8 cores to get the GB processed per core, and then simply divide those GB by the bandwidth of the core to find how long it would take for each core (or all 8 cores) to process the entire weight matrix.
 
-$$\text{Workload per chip} = \frac{35 \times 10^9 \text{ bytes}}{8 \text{ cores}} = \mathbf{4.375 \times 10^9 \text{ bytes per core}}$$
+$$
+\text{Workload per chip} = \frac{35 \times 10^9 \text{ bytes}}{8 \text{ cores}} = \mathbf{4.375 \times 10^9 \text{ bytes per core}}
+$$
 
-$$\text{Time to load} = \frac{4.375 \times 10^9 \text{ bytes}}{4.5 \times 10^{11} \text{ bytes/s}} = \mathbf{0.009722 \text{ seconds}}$$
+$$
+\text{Time to load} = \frac{4.375 \times 10^9 \text{ bytes}}{4.5 \times 10^{11} \text{ bytes/s}} = \mathbf{0.009722 \text{ seconds}}
+$$
 
 It takes us **9.72 milliseconds** to load all parameters from HBM into our pipelines.
 
@@ -159,23 +175,39 @@ Consider a full TPU v5e pod. How many total CPU hosts are there? How many TPU Te
 
 - **v5e:** Our references say a full v5e pod is a 16x16 shape (256 chips) with a host size of 4x2 (8 chips). Having 1 CPU host per 8 chips, we have 32 CPUs in a full 256 pod. Each TPU has 1 TensorCore, so 256 Cores total. Assuming bf16 parameters, each chip outputs $1.97 \times 10^{14}$ FLOPs, $\times 256$ is 50.4 PFLOPs. Each chip has 16GB HBM, so the pod total as 16x256, 4096 GB HBM.
     
-    - $$\text{Total CPU Hosts} = \frac{256 \text{ chips}}{8 \text{ chips/host}} = \mathbf{32 \text{ hosts}}$$
+    - $$
+      \text{Total CPU Hosts} = \frac{256 \text{ chips}}{8 \text{ chips/host}} = \mathbf{32 \text{ hosts}}
+      $$
         
-    - $$\text{Total TPU TensorCores} = 256 \text{ chips} \times 1 \text{ core/chip} = \mathbf{256 \text{ TensorCores}}$$
+    - $$
+      \text{Total TPU TensorCores} = 256 \text{ chips} \times 1 \text{ core/chip} = \mathbf{256 \text{ TensorCores}}
+      $$
         
-    - $$\text{Total FLOPs/s (BF16)} = 256 \text{ chips} \times 1.97 \times 10^{14} \text{ FLOPs/s} = \mathbf{5.043 \times 10^{16} \text{ FLOPs/s (50.4 PFLOPs)}}$$
+    - $$
+      \text{Total FLOPs/s (BF16)} = 256 \text{ chips} \times 1.97 \times 10^{14} \text{ FLOPs/s} = \mathbf{5.043 \times 10^{16} \text{ FLOPs/s (50.4 PFLOPs)}}
+      $$
         
-    - $$\text{Total HBM} = 256 \text{ chips} \times 16 \text{ GB/chip} = \mathbf{4,096 \text{ GB}}$$
+    - $$
+      \text{Total HBM} = 256 \text{ chips} \times 16 \text{ GB/chip} = \mathbf{4{,}096 \text{ GB}}
+      $$
         
-- **v5p:** A full v5p pod is 16x20x28, or 8,960 chips. Each CPU host contains 4 chips, so our full pod contains 2,240 CPUs. Because each v5p chip contains 2 TensorCores, we have 17,920 Cores. Assuming bf16 parameters, each chip outputs $4.59 \times 10^{14}$ FLOPs/s, $\times 8,960$ comes out to $4.11 \times 10^{18}$, or 4.11 ExaFLOPs. With 96GB HBM/chip, our full pod has 840TB of HBM.
+- **v5p:** A full v5p pod is 16x20x28, or 8,960 chips. Each CPU host contains 4 chips, so our full pod contains 2,240 CPUs. Because each v5p chip contains 2 TensorCores, we have 17,920 Cores. Assuming bf16 parameters, each chip outputs $4.59 \times 10^{14}$ FLOPs/s, $\times 8{,}960$ comes out to $4.11 \times 10^{18}$, or 4.11 ExaFLOPs. With 96GB HBM/chip, our full pod has 840TB of HBM.
     
-    - $$\text{Total CPU Hosts} = \frac{8,960 \text{ chips}}{4 \text{ chips/host}} = \mathbf{2,240 \text{ hosts}}$$
+    - $$
+      \text{Total CPU Hosts} = \frac{8{,}960 \text{ chips}}{4 \text{ chips/host}} = \mathbf{2{,}240 \text{ hosts}}
+      $$
         
-    - $$\text{Total TPU TensorCores} = 8,960 \text{ chips} \times 2 \text{ cores/chip} = \mathbf{17,920 \text{ TensorCores}}$$
+    - $$
+      \text{Total TPU TensorCores} = 8{,}960 \text{ chips} \times 2 \text{ cores/chip} = \mathbf{17{,}920 \text{ TensorCores}}
+      $$
         
-    - $$\text{Total FLOPs/s (BF16)} = 8,960 \text{ chips} \times 4.59 \times 10^{14} \text{ FLOPs/s} = \mathbf{4.1126 \times 10^{18} \text{ FLOPs/s (4.11 ExaFLOPs)}}$$
+    - $$
+      \text{Total FLOPs/s (BF16)} = 8{,}960 \text{ chips} \times 4.59 \times 10^{14} \text{ FLOPs/s} = \mathbf{4.1126 \times 10^{18} \text{ FLOPs/s (4.11 ExaFLOPs)}}
+      $$
         
-    - $$\text{Total HBM} = 8,960 \text{ chips} \times 96 \text{ GB/chip} = \mathbf{860,160 \text{ GB (840 TB)}}$$
+    - $$
+      \text{Total HBM} = 8{,}960 \text{ chips} \times 96 \text{ GB/chip} = \mathbf{860{,}160 \text{ GB (840 TB)}}
+      $$
         
 
 ### Question 2a [Partial Slice Provisioning]
@@ -184,13 +216,21 @@ An engineering team doesn't buy a full TPU v5p pod; instead, they provision a sm
 
 Using the same TPU v5p hardware metrics from your notes (2 TensorCores/chip, $4.59 \times 10^{14}$ BF16 FLOPs/s/chip, and 96 GB HBM/chip): Calculate the total number of CPU hosts, total TPU TensorCores, total BF16 FLOPs/s, and total HBM available in this specific $8 \times 8 \times 8$ slice configuration.
 
-- $$\text{Total CPU Hosts} = \frac{512 \text{ chips}}{4 \text{ chips/host}} = \mathbf{128 \text{ hosts}}$$
+- $$
+  \text{Total CPU Hosts} = \frac{512 \text{ chips}}{4 \text{ chips/host}} = \mathbf{128 \text{ hosts}}
+  $$
     
-- $$\text{Total TPU TensorCores} = 512 \text{ chips} \times 2 \text{ cores/chip} = \mathbf{1,024 \text{ TensorCores}}$$
+- $$
+  \text{Total TPU TensorCores} = 512 \text{ chips} \times 2 \text{ cores/chip} = \mathbf{1{,}024 \text{ TensorCores}}
+  $$
     
-- $$\text{Total FLOPs/s (BF16)} = 512 \text{ chips} \times 4.59 \times 10^{14} \text{ FLOPs/s} = \mathbf{2.35 \times 10^{17} \text{ FLOPs/s (235 PFLOPs)}}$$
+- $$
+  \text{Total FLOPs/s (BF16)} = 512 \text{ chips} \times 4.59 \times 10^{14} \text{ FLOPs/s} = \mathbf{2.35 \times 10^{17} \text{ FLOPs/s (235 PFLOPs)}}
+  $$
     
-- $$\text{Total HBM} = 512 \text{ chips} \times 96 \text{ GB/chip} = \mathbf{49,152 \text{ GB (49.15 TB)}}$$
+- $$
+  \text{Total HBM} = 512 \text{ chips} \times 96 \text{ GB/chip} = \mathbf{49{,}152 \text{ GB (49.15 TB)}}
+  $$
     
 
 ### Question 2b [Int8 Quantized Inference Pod]
@@ -199,13 +239,21 @@ A team wants to run a massive quantized inference workload across a full TPU v5e
 
 The Task: Calculate the total CPU hosts, total TPU TensorCores, total int8 performance (in PFLOPs or POPs/s), and total HBM for this inference setup. How does switching to int8 alter the compute capacity versus your original bf16 v5e pod notes?
 
-- $$\text{Total CPU Hosts} = \frac{256 \text{ chips}}{8 \text{ chips/host}} = \mathbf{32 \text{ hosts}}$$
+- $$
+  \text{Total CPU Hosts} = \frac{256 \text{ chips}}{8 \text{ chips/host}} = \mathbf{32 \text{ hosts}}
+  $$
     
-- $$\text{Total TPU TensorCores} = 256 \text{ chips} \times 1 \text{ core/chip} = \mathbf{256 \text{ TensorCores}}$$
+- $$
+  \text{Total TPU TensorCores} = 256 \text{ chips} \times 1 \text{ core/chip} = \mathbf{256 \text{ TensorCores}}
+  $$
     
-- $$\text{Total Peak Compute (INT8)} = 256 \text{ chips} \times 3.94 \times 10^{14} \text{ OPs/s} = \mathbf{1.0086 \times 10^{17} \text{ OPs/s (100.9 POPs/s)}}$$
+- $$
+  \text{Total Peak Compute (INT8)} = 256 \text{ chips} \times 3.94 \times 10^{14} \text{ OPs/s} = \mathbf{1.0086 \times 10^{17} \text{ OPs/s (100.9 POPs/s)}}
+  $$
     
-- $$\text{Total HBM} = 256 \text{ chips} \times 16 \text{ GB/chip} = \mathbf{4,096 \text{ GB (4.096 TB)}}$$
+- $$
+  \text{Total HBM} = 256 \text{ chips} \times 16 \text{ GB/chip} = \mathbf{4{,}096 \text{ GB (4.096 TB)}}
+  $$
     
 
 > Quantizing from bf16 to int8 doubles our compute throughput since we require less hardware area per lane, so our systolic array can pack and process twice as many numbers per cycle without changing any physical footprint.
@@ -216,17 +264,25 @@ Imagine we’re forced to store a big weight matrix $A$ of type $\text{bf16}[D,F
 
 We take our Time to compute and Time spent transferring over PCIe:
 
-$$T_{\text{PCIe}} = \frac{2BD + 2DF + 2BF}{1.6 \times 10^{10}} = \frac{2(BD + DF + BF)}{1.6 \times 10^{10}}$$
+$$
+T_{\text{PCIe}} = \frac{2BD + 2DF + 2BF}{1.6 \times 10^{10}} = \frac{2(BD + DF + BF)}{1.6 \times 10^{10}}
+$$
 
-$$T_{\text{compute}} = \frac{\text{Total FLOPs}}{\text{TPU Compute Speed}} = \frac{2BDF}{9.2 \times 10^{14}}$$
+$$
+T_{\text{compute}} = \frac{\text{Total FLOPs}}{\text{TPU Compute Speed}} = \frac{2BDF}{9.2 \times 10^{14}}
+$$
 
 _(Note: Because $F=4D$, the denominators are $8BD^2$ and $8D^2$ for compute and PCIe respectively, but this doesn't change the final calculation as it cancels out)._
 
 Just isolate for batch size:
 
-$$\frac{B}{9.2 \times 10^{14}} > \frac{1}{1.6 \times 10^{10}}$$
+$$
+\frac{B}{9.2 \times 10^{14}} > \frac{1}{1.6 \times 10^{10}}
+$$
 
-$$B > \frac{9.2 \times 10^{14} \text{ FLOPs/s}}{1.6 \times 10^{10} \text{ bytes/s}} \implies B > 57,500$$
+$$
+B > \frac{9.2 \times 10^{14} \text{ FLOPs/s}}{1.6 \times 10^{10} \text{ bytes/s}} \implies B > 57{,}500
+$$
 
 The processing batch needs to be at **57,500 tokens minimum** to remain FLOPs bound over PCIe.
 
@@ -251,9 +307,11 @@ The Task: Using the balanced time inequality framework under the assumption that
 
 Same process where we take the total operations required / peak compute speed $>$ total memory ops / PCIe bandwidth:
 
-$$\frac{2BDF}{2.4 \times 10^{15}} > \frac{2(BD + DF + BF)}{1.28 \times 10^{11}} \implies B > \frac{2.4 \times 10^{15} \text{ FLOPs/s}}{1.28 \times 10^{11} \text{ bytes/s}}$$
+$$
+\frac{2BDF}{2.4 \times 10^{15}} > \frac{2(BD + DF + BF)}{1.28 \times 10^{11}} \implies B > \frac{2.4 \times 10^{15} \text{ FLOPs/s}}{1.28 \times 10^{11} \text{ bytes/s}}
+$$
 
-Which comes out to: **$B > 18,750$**. Because of the asymptotic reduction, we can jump straight to the HCI calculation and find we need at least 18,750 tokens within each batch to remain compute-bound.
+Which comes out to: **$B > 18{,}750$**. Because of the asymptotic reduction, we can jump straight to the HCI calculation and find we need at least 18,750 tokens within each batch to remain compute-bound.
 
 ### Question 3b [Edge Mobile Accelerator via PCIe Gen 4]
 
@@ -270,7 +328,9 @@ The Task: Using the balanced time inequality framework under the assumption that
 
 Same asymptotic reduction:
 
-$$\frac{2BDF}{8.0 \times 10^{13}} > \frac{2DF}{8.0 \times 10^9} \implies B > \mathbf{10,000 \text{ tokens}}$$
+$$
+\frac{2BDF}{8.0 \times 10^{13}} > \frac{2DF}{8.0 \times 10^9} \implies B > \mathbf{10{,}000 \text{ tokens}}
+$$
 
 ### Question 4 [general matmul latency]
 
@@ -278,19 +338,27 @@ Let’s say we want to multiply a weight matrix $\text{int8}[16384, 4096]$ by an
 
 How long will this multiplication take as a function of $B$? Hint: it may help to calculate how long it will take to load the arrays from HBM and how long the multiplication will actually take. Which is bottlenecking you?
 
-This question is literally just asking us to algebraically isolate the variable $B$ after accounting for all the bytes. We know our weight matrix bytes ($16384 \times 4096 \times 1\text{ byte} = 67,108,864\text{ bytes}$), activation matrix bytes ($B \times 4096 \times 1\text{ byte} = 4096B$), and output bytes ($B \times 16384 \times 1 = 16384B\text{ bytes}$). Then we also find our OP bytes, which is $2BDF$, so $(2 \times B \times 4096 \times 16384) = 134,217,728B\text{ Operations}$.
+This question is literally just asking us to algebraically isolate the variable $B$ after accounting for all the bytes. We know our weight matrix bytes ($16384 \times 4096 \times 1\text{ byte} = 67{,}108{,}864\text{ bytes}$), activation matrix bytes ($B \times 4096 \times 1\text{ byte} = 4096B$), and output bytes ($B \times 16384 \times 1 = 16384B\text{ bytes}$). Then we also find our OP bytes, which is $2BDF$, so $(2 \times B \times 4096 \times 16384) = 134{,}217{,}728B\text{ Operations}$.
 
-$$T_{\text{compute}}(B) = \frac{134,217,728B}{3.94 \times 10^{14}} \approx \mathbf{3.407 \times 10^{-7}B \text{ seconds}}$$
+$$
+T_{\text{compute}}(B) = \frac{134{,}217{,}728B}{3.94 \times 10^{14}} \approx \mathbf{3.407 \times 10^{-7}B \text{ seconds}}
+$$
 
-$$T_{\text{HBM}}(B) = \frac{67,108,864 + 20,480B}{8.2 \times 10^{11}} \approx \mathbf{8.184 \times 10^{-5} + 2.498 \times 10^{-8}B \text{ seconds}}$$
+$$
+T_{\text{HBM}}(B) = \frac{67{,}108{,}864 + 20{,}480B}{8.2 \times 10^{11}} \approx \mathbf{8.184 \times 10^{-5} + 2.498 \times 10^{-8}B \text{ seconds}}
+$$
 
 We can't execute the math faster than we can load memory, so looking back in Chapter 1, our execution duration is the maximum of these 2 independent times. Using the numbers we got, for small batch sizes like $B = 1$, $T_{\text{HBM}} \approx 81.84 \ \mu\text{s}$ while $T_{\text{compute}} \approx 0.34 \ \mu\text{s}$, meaning a dominant memory bottleneck.
 
 To find the batch size needed to become compute bound, we set the two systems equal to each other:
 
-$$3.407 \times 10^{-7}B = 8.184 \times 10^{-5} + 2.498 \times 10^{-8}B$$
+$$
+3.407 \times 10^{-7}B = 8.184 \times 10^{-5} + 2.498 \times 10^{-8}B
+$$
 
-$$3.157 \times 10^{-7}B = 8.184 \times 10^{-5} \implies B \approx \mathbf{259.2}$$
+$$
+3.157 \times 10^{-7}B = 8.184 \times 10^{-5} \implies B \approx \mathbf{259.2}
+$$
 
 **What if we wanted to run this operation out of VMEM? How long would it take as a function of B?**
 
@@ -310,16 +378,36 @@ Let's scale up to Google's newer **TPU v6e** architecture. A team wants to run a
 
  **The Task:** 
 1. Calculate the raw theoretical VMEM bandwidth for the TPU v6e. 
-	- $$\text{VMEM Bandwidth} = 24 \times (1.60 \times 10^{12} \text{ bytes/s}) = \mathbf{3.84 \times 10^{13} \text{ bytes/s}}$$
+	- $$
+	  \text{VMEM Bandwidth} = 24 \times (1.60 \times 10^{12} \text{ bytes/s}) = \mathbf{3.84 \times 10^{13} \text{ bytes/s}}
+	  $$
 2. Assuming the arrays are resident in VMEM, derive the minimum token batch size ($B$) required to cross the critical intensity threshold and become completely compute-bound.
 	- Int8 means 1 byte per element. We know our 2BDF operations (2 x B x 16384 x 4096) and our BD DF BF network transfers. Clearly our weight matrix is given as 16384 x 4096, and our B is unknown.  Then we just want to put each respective total over their peak compute and peak HBM bandwidth to find compute-bound batch size for HBM, or swap out HBM for VMEM respectively. We're already given our Peak Compute Speed, so we need to find our total int8 OPs and total traffic: 
-	- $$\text{Total Storage Traffic Bytes} = 67,108,864 + 4,096B + 16,384B = \mathbf{67,108,864 + 20,480B \text{ bytes}}$$
-	- $$\text{Total INT8 OPs} = 2 \times B \times 16384 \times 4096 = \mathbf{134,217,728B}$$
-	- Set up our inequality equation: $$\frac{134,217,728B}{9.20 \times 10^{14}} > \frac{67,108,864 + 20,480B}{3.84 \times 10^{13}}$$
+	- $$
+	  \text{Total Storage Traffic Bytes} = 67{,}108{,}864 + 4{,}096B + 16{,}384B = \mathbf{67{,}108{,}864 + 20{,}480B \text{ bytes}}
+	  $$
+	- $$
+	  \text{Total INT8 OPs} = 2 \times B \times 16384 \times 4096 = \mathbf{134{,}217{,}728B}
+	  $$
+	- Set up our inequality equation:
+
+	  $$
+	  \frac{134{,}217{,}728B}{9.20 \times 10^{14}} > \frac{67{,}108{,}864 + 20{,}480B}{3.84 \times 10^{13}}
+	  $$
 	- Simplify both sides by dividing individual terms, and then isolate for B:  
-	- Coming to: $$1.4589 \times 10^{-7}B > 1.7476 \times 10^{-6} + 5.3333 \times 10^{-10}B$$
-	- $$B > \frac{1.7476 \times 10^{-6}}{1.4536 \times 10^{-7}}$$
-	1. Our required batch size needs to be: $$B > \mathbf{12.02}$$
+	- Coming to:
+
+	  $$
+	  1.4589 \times 10^{-7}B > 1.7476 \times 10^{-6} + 5.3333 \times 10^{-10}B
+	  $$
+	- $$
+	  B > \frac{1.7476 \times 10^{-6}}{1.4536 \times 10^{-7}}
+	  $$
+	1. Our required batch size needs to be:
+
+	   $$
+	   B > \mathbf{12.02}
+	   $$
 	2. A side note: If you're curious about why we're running these hypothetical scenarios where we run entirely 'out of VMEM', that makes sense, because VMEM is, in reality only a few dozen MB at best (but much faster than HBM) while HBM is several dozen GB at least. 'Running out of VMEM' is a scenario where we experience perfect, unthrottled streaming speed done with a technique called prefetching. When we load Chunk A from our HBM into our VMEM, while the MXU is performing, the memory controller is already pulling Chunk B out of HBM so the MXU can instantly move to the next Chunk without waiting. This 'perfect prefetching scenario' means we completely mask the HBM delay so we can see how the chip acts when it's not lacking data.
 ### Question 4b [Accounting for Practical Contention]
 
@@ -329,15 +417,25 @@ However, instead of using the perfect theoretical multiplier of 22, the compiler
 
 **The Task:** 
 - Calculate the realistic, practical VMEM bandwidth under contention.
-	- $$\text{Practical VMEM Speed} = 20 \times (8.2 \times 10^{11} \text{ bytes/s}) = \mathbf{1.64 \times 10^{13} \text{ bytes/s}}$$
+	- $$
+	  \text{Practical VMEM Speed} = 20 \times (8.2 \times 10^{11} \text{ bytes/s}) = \mathbf{1.64 \times 10^{13} \text{ bytes/s}}
+	  $$
 - Determine the new minimum batch size ($B$) needed to saturate the execution pipelines under these real-world conditions. Compare it to the theoretical boundary ($B > 11$) to see how contention shifts your operational requirements.
-	- $$\frac{134,217,728B}{3.94 \times 10^{14}} > \frac{67,108,864 + 20,480B}{1.64 \times 10^{13}}$$
+	- $$
+	  \frac{134{,}217{,}728B}{3.94 \times 10^{14}} > \frac{67{,}108{,}864 + 20{,}480B}{1.64 \times 10^{13}}
+	  $$
 
-	- $$3.4065 \times 10^{-7}B > 4.0920 \times 10^{-6} + 1.2488 \times 10^{-9}B$$
+	- $$
+	  3.4065 \times 10^{-7}B > 4.0920 \times 10^{-6} + 1.2488 \times 10^{-9}B
+	  $$
 
-	- $$3.3940 \times 10^{-7}B > 4.0920 \times 10^{-6}$$
+	- $$
+	  3.3940 \times 10^{-7}B > 4.0920 \times 10^{-6}
+	  $$
 
-	- $$B > 12.06 \implies \mathbf{B \ge 13 \text{ tokens}}$$
+	- $$
+	  B > 12.06 \implies \mathbf{B \ge 13 \text{ tokens}}
+	  $$
 	- Because of shared bus lane overheads, our theoretical token concurrency shifts from a theoretical B > 11 to a B > 13 tokens to fully mask memory latency. 
 	- What does B > x mean? For users, smaller x this means less time to first token (TFTT) since we don't have to wait for other users tokens to finish processing. For engineers, larger x means more hardware utilization and better efficiency. The trick is to have this equilibrium between low TFTT and maximum hardware utilization (so not to waste money through starvation cycles). 
 
@@ -353,8 +451,12 @@ However, instead of using the perfect theoretical multiplier of 22, the compiler
 	- Starting at 0,0, it would take us 14 total hops (7 up, 7 horizontal) to get to 7,7. 14 hops x 0.8 microseconds = 11.2 microseconds. 
 2. Calculate the Total Transfer Time assuming the data footprint is split equally across two active routing ports simultaneously.
 	- We only care about sending the whole tensor from A to B. Our total bytes to stream are 2 x 16 x 256 x 4096, or 33,554,432 bytes. Remembering that we use 2 pipes instead of 1 (bi-directional), our ICI bandwidth essentially doubles to 2.0e11 bytes. 
-	- $$\text{Serialization Time} = \frac{33,554,432 \text{ bytes}}{2.0 \times 10^{11} \text{ bytes/s}} = 0.00016777 \text{ seconds} = \mathbf{167.8 \ \mu\text{s}}$$
-	- $$\text{Total Transfer Time} = 167.8 \ \mu\text{s} + 11.2 \ \mu\text{s} = \mathbf{179.0 \ \mu\text{s}}$$
+	- $$
+	  \text{Serialization Time} = \frac{33{,}554{,}432 \text{ bytes}}{2.0 \times 10^{11} \text{ bytes/s}} = 0.00016777 \text{ seconds} = \mathbf{167.8 \ \mu\text{s}}
+	  $$
+	- $$
+	  \text{Total Transfer Time} = 167.8 \ \mu\text{s} + 11.2 \ \mu\text{s} = \mathbf{179.0 \ \mu\text{s}}
+	  $$
 
 **Question 5b [Asymmetric Rectangular Slice Routing]:** A bf16[4, 512, 2048] tensor is transmitted across a rectangular 4x8 sub-slice of TPU v5e chips from coordinate (0,0) to (3,7). The grid lacks wrap-around connections on both axes. Each interconnect channel features a link bandwidth of $4.5 \times 10^{10} \text{ bytes/s}$ and a fixed router delay of $1.0 \ \mu\text{s}$ per hop.
 1. Calculate the First Byte Arrival Time.
@@ -362,9 +464,11 @@ However, instead of using the perfect theoretical multiplier of 22, the compiler
 2. Determine the Total Transfer Time utilizing dual-port parallel streaming out of the source coordinate.
 	- Total bytes: 2 x 4 x 512 x 2048 = 8,388,608 bytes. 
 	- Total ICI bandwidth (given x2 because bidirectional pipes): 9.0e10 bytes
-	- $$\text{Total Transfer Time} = 93.2 \ \mu\text{s} + 10.0 \ \mu\text{s} = \mathbf{103.2 \ \mu\text{s}}$$
+	- $$
+	  \text{Total Transfer Time} = 93.2 \ \mu\text{s} + 10.0 \ \mu\text{s} = \mathbf{103.2 \ \mu\text{s}}
+	  $$
 
-**Question 6 [pulling it all together, hard]:** Imagine you have a big matrix **A**: `int8[128 * 1024, 128 * 1024]` sharded evenly across a TPU v5e 4x4 slice but offloaded to host DRAM on each chip. Let’s say you want to copy the entire array to TPU{0, 0} and multiply it by a vector `bf16[8, 128 * 1024]`. How long will this take? _Hint: use the numbers above._
+**Question 6 [pulling it all together, hard]:** Imagine you have a big matrix **A**: `int8[128 * 1024, 128 * 1024]` sharded evenly across a TPU v5e 4x4 slice but offloaded to host DRAM on each chip. Let’s say you want to copy the entire array to `TPU{0, 0}` and multiply it by a vector `bf16[8, 128 * 1024]`. How long will this take? _Hint: use the numbers above._
 - Basically our matrix dimensions are int8 A[131072,131072]. This means we have 131072 x 131072 x 1 bytes, or 17,179,869,184 bytes, simplified to 16GB.
 - We also need to pay attention to the wording here. Offloading to the host DRAM means that we're not sitting in HBM, but each chips portion of the matrix sits in the CPU's DRAM, which involves travelling from the Host CPU DRAM to the local TPU through the PCIe bus lanes. So, Each host basically has 1/2 of the total matrix, which is shared to each individual TPU through PCIe. 
 - So, when we want to copy the entire array to TPU 0,0, we take all the shards that travel across the ICI network cables from the other 15 chips. Each chip, having 1/16 of the entire matrix, would be shard width (131072/4) and shard height (131072/4) = 32768. So each chip holds a [32768,32768] matrix (1/4 of the height, 1/4 of the width = 1/16 of the total matrix).
@@ -373,7 +477,11 @@ However, instead of using the perfect theoretical multiplier of 22, the compiler
 - In practice, going from 3,3 to 0,0 introduces our TPUs at 0,1 and 0,2 etc as bottlenecks as they also have to catch and forward the shards coming from all previous TPUs. Traffic logically gets denser the closer we get to 0,0. However, we can just average this out and assume that we're sending 15GB over our ICI bandwidth of 9.0e10 (bidirectional) which comes to around 167ms. 
 - We've finished the network portion so now for the inner-chip movement from HBM to MXU, we need to load our bytes from HBM to MXU. So, 16GB / 8.2e11 (HBM Bandwidth) = 20ms.
 - We need to finally do our actual math in the MXU, multiplying our Matrix A by our Vector X. 
-- Note: The 2JBM FLOPs formula tells us that when we multiply a matrix of shake [M,K] by a matrix of shape [K,N], the total FLOPs is 2xMxKxN. This comes to:$$\text{Total FLOPs} = 2 \times \underbrace{\vphantom{12}8}_{M} \times \underbrace{(128 \times 1024)}_{K} \times \underbrace{(128 \times 1024)}_{N}$$
+- Note: The 2JBM FLOPs formula tells us that when we multiply a matrix of shake [M,K] by a matrix of shape [K,N], the total FLOPs is 2xMxKxN. This comes to:
+
+  $$
+  \text{Total FLOPs} = 2 \times \underbrace{\vphantom{12}8}_{M} \times \underbrace{(128 \times 1024)}_{K} \times \underbrace{(128 \times 1024)}_{N}
+  $$
 - Resulting in 2.7e11 FLOPs / 1.97e14 bf16 FLOPs/s, comes to 1.4ms. 
 
 ## Reference Numbers
